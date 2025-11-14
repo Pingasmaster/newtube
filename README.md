@@ -5,15 +5,6 @@ There is no account system, but history and likes/dislikes still work. You can s
 
 The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
 
-# Rust backend
-
-Compile and get the binaries in the current directory:
-
-```
-cargo clean && cargo build --release
-cp target/release/backend target/release/download_channel target/release/routine_update .
-```
-
 ## Using the Rust Backend
 
 Compile and get the binaries in the current directory:

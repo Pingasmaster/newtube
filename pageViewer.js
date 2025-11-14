@@ -81,6 +81,11 @@ class VideoViewer extends BaseViewer {
         this.videoid = videoid;
         this.timestamp = timestamp;
         this.player = null;
+        this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
+        this.likeButton = null;
+        this.dislikeButton = null;
+        this.saveButton = null;
+        this.subscribeBtn = null;
     }
 
     async init() {
@@ -116,15 +121,19 @@ class VideoViewer extends BaseViewer {
                             <span>${this.formatDate(this.videoData.uploadDate)}</span>
                         </div>
                         <div class="video-actions">
-                            <button class="action-btn">
+                            <button class="action-btn like-btn" type="button">
                                 <span class="action-icon">👍</span>
                                 <span>${this.formatCount(this.videoData.likes)}</span>
                             </button>
-                            <button class="action-btn">
+                            <button class="action-btn dislike-btn" type="button">
                                 <span class="action-icon">👎</span>
                                 <span>${this.formatCount(this.videoData.dislikes)}</span>
                             </button>
-                            <button class="action-btn">
+                            <button class="action-btn save-btn" type="button">
+                                <span class="action-icon">📁</span>
+                                <span>Save</span>
+                            </button>
+                            <button class="action-btn share-btn" type="button">
                                 <span class="action-icon">↗️</span>
                                 <span>Share</span>
                             </button>
@@ -135,11 +144,12 @@ class VideoViewer extends BaseViewer {
                                 <div class="channel-name">${this.escapeHtml(this.videoData.author)}</div>
                                 <div class="channel-subs">${this.formatCount(this.videoData.subscriberCount)} subscribers</div>
                             </div>
-                            <button class="subscribe-btn">Subscribe</button>
+                            <button class="subscribe-btn" type="button">Subscribe</button>
                         </div>
                         <div class="video-description">
                             <p>${this.escapeHtml(this.videoData.description)}</p>
                         </div>
+                        <div class="video-data-note">Likes, dislikes, playlists, and subscriptions are stored securely in local storage. Export them from the You menu to sync another device.</div>
                     </div>
                     <div class="comments-section">
                         <h3>${this.comments.length} Comments</h3>
@@ -156,7 +166,118 @@ class VideoViewer extends BaseViewer {
 
         this.container.appendChild(pageContainer);
         this.setupPlayer();
+        this.setupActions();
         this.renderComments();
+    }
+
+    getVideoMetadata() {
+        const thumbnail = this.videoData?.thumbnailUrl || (Array.isArray(this.videoData?.thumbnails) ? this.videoData.thumbnails[0] : null);
+        return {
+            videoid: this.videoid,
+            title: this.videoData?.title || null,
+            author: this.videoData?.author || null,
+            channelId: this.getChannelId(),
+            thumbnail
+        };
+    }
+
+    getChannelId() {
+        if (this.videoData?.channelUrl) {
+            return this.videoData.channelUrl;
+        }
+        if (this.videoData?.author) {
+            return `channel:${this.videoData.author}`;
+        }
+        return `channel:${this.videoid}`;
+    }
+
+    setupActions() {
+        const root = this.container.querySelector('.viewer-main');
+        if (!root) {
+            return;
+        }
+        this.likeButton = root.querySelector('.like-btn');
+        this.dislikeButton = root.querySelector('.dislike-btn');
+        this.saveButton = root.querySelector('.save-btn');
+        this.subscribeBtn = root.querySelector('.subscribe-btn');
+
+        if (this.likeButton) {
+            this.likeButton.addEventListener('click', () => this.handleLike());
+        }
+        if (this.dislikeButton) {
+            this.dislikeButton.addEventListener('click', () => this.handleDislike());
+        }
+        if (this.saveButton) {
+            this.saveButton.addEventListener('click', () => this.handleSaveToPlaylist());
+        }
+        if (this.subscribeBtn) {
+            this.subscribeBtn.addEventListener('click', () => this.handleSubscribe());
+        }
+
+        this.syncActionState();
+    }
+
+    syncActionState() {
+        if (!this.userDataStore) {
+            return;
+        }
+        const reaction = this.userDataStore.getReaction(this.videoid);
+        if (this.likeButton) {
+            this.likeButton.classList.toggle('active', reaction === 'like');
+        }
+        if (this.dislikeButton) {
+            this.dislikeButton.classList.toggle('active', reaction === 'dislike');
+        }
+        if (this.subscribeBtn) {
+            const isSubscribed = this.userDataStore.isSubscribed(this.getChannelId());
+            this.subscribeBtn.classList.toggle('subscribed', isSubscribed);
+            this.subscribeBtn.textContent = isSubscribed ? 'Subscribed' : 'Subscribe';
+        }
+    }
+
+    handleLike() {
+        if (!this.userDataStore) {
+            return;
+        }
+        this.userDataStore.toggleLike(this.videoid, this.getVideoMetadata());
+        this.syncActionState();
+    }
+
+    handleDislike() {
+        if (!this.userDataStore) {
+            return;
+        }
+        this.userDataStore.toggleDislike(this.videoid, this.getVideoMetadata());
+        this.syncActionState();
+    }
+
+    handleSaveToPlaylist() {
+        if (!this.userDataStore) {
+            return;
+        }
+        const name = prompt('Save to which playlist? Leave blank for Favorites.', 'Favorites');
+        if (name === null) {
+            return;
+        }
+        const playlistName = name.trim() || 'Favorites';
+        this.userDataStore.addToPlaylist(playlistName, this.videoid, this.getVideoMetadata());
+        alert(`Added to "${playlistName}". This playlist lives locally until you export it from the You menu.`);
+    }
+
+    handleSubscribe() {
+        if (!this.userDataStore) {
+            return;
+        }
+        const subscribed = this.userDataStore.toggleSubscription(this.getChannelId(), {
+            name: this.videoData?.author,
+            channelUrl: this.videoData?.channelUrl
+        });
+        this.syncActionState();
+        if (subscribed) {
+            alert('Subscribed! This preference stays on this device unless you export/import your data.');
+        } else {
+            alert('Subscription removed from this device.');
+        }
     }
 
     renderSources() {
@@ -188,8 +309,41 @@ class VideoViewer extends BaseViewer {
 
     setupPlayer() {
         this.player = document.getElementById('videoPlayer');
-        if (this.player && this.timestamp > 0) {
+        if (!this.player) {
+            return;
+        }
+
+        if (this.timestamp > 0) {
             this.player.currentTime = this.timestamp;
+        }
+
+        this.player.addEventListener('loadedmetadata', () => this.restoreWatchProgress());
+        this.player.addEventListener('timeupdate', () => this.recordWatchProgress());
+        this.player.addEventListener('ended', () => this.handleVideoEnded());
+    }
+
+    recordWatchProgress() {
+        if (!this.userDataStore || !this.player || !this.player.duration) {
+            return;
+        }
+        const progress = this.player.currentTime / this.player.duration;
+        this.userDataStore.setWatchProgress(this.videoid, progress, this.getVideoMetadata());
+    }
+
+    handleVideoEnded() {
+        if (!this.userDataStore) {
+            return;
+        }
+        this.userDataStore.markWatched(this.videoid, this.getVideoMetadata());
+    }
+
+    restoreWatchProgress() {
+        if (!this.userDataStore || !this.player || !this.player.duration || this.timestamp > 0) {
+            return;
+        }
+        const savedProgress = this.userDataStore.getWatchProgress(this.videoid);
+        if (savedProgress > 0 && savedProgress < 0.98) {
+            this.player.currentTime = savedProgress * this.player.duration;
         }
     }
 
@@ -273,6 +427,10 @@ class ShortsViewer extends BaseViewer {
         super(services);
         this.videoid = videoid;
         this.player = null;
+        this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
+        this.likeButton = null;
+        this.dislikeButton = null;
+        this.saveButton = null;
     }
 
     async init() {
@@ -303,19 +461,23 @@ class ShortsViewer extends BaseViewer {
                             <div class="shorts-title">${this.escapeHtml(this.videoData.title)}</div>
                         </div>
                         <div class="shorts-actions">
-                            <button class="shorts-action-btn">
+                            <button class="shorts-action-btn like-btn" type="button">
                                 <span class="action-icon">👍</span>
                                 <span>${this.formatCount(this.videoData.likes)}</span>
                             </button>
-                            <button class="shorts-action-btn">
+                            <button class="shorts-action-btn dislike-btn" type="button">
                                 <span class="action-icon">👎</span>
                                 <span>Dislike</span>
                             </button>
-                            <button class="shorts-action-btn">
+                            <button class="shorts-action-btn save-btn" type="button">
+                                <span class="action-icon">📁</span>
+                                <span>Save</span>
+                            </button>
+                            <button class="shorts-action-btn" type="button">
                                 <span class="action-icon">💬</span>
                                 <span>${this.comments.length}</span>
                             </button>
-                            <button class="shorts-action-btn">
+                            <button class="shorts-action-btn" type="button">
                                 <span class="action-icon">↗️</span>
                                 <span>Share</span>
                             </button>
@@ -331,6 +493,7 @@ class ShortsViewer extends BaseViewer {
 
         this.container.appendChild(pageContainer);
         this.setupPlayer();
+        this.setupShortActions();
     }
 
     renderSources() {
@@ -355,6 +518,96 @@ class ShortsViewer extends BaseViewer {
         this.player = document.getElementById('shortsPlayer');
         if (this.player) {
             this.player.play().catch(err => console.log('Autoplay prevented:', err));
+            this.player.addEventListener('timeupdate', () => this.recordShortProgress());
+            this.player.addEventListener('ended', () => this.markShortWatched());
+        }
+    }
+
+    getShortMetadata() {
+        return {
+            videoid: this.videoid,
+            title: this.videoData?.title || null,
+            author: this.videoData?.author || null,
+            channelId: this.videoData?.author ? `shorts:${this.videoData.author}` : `shorts:${this.videoid}`,
+            thumbnail: this.videoData?.thumbnailUrl || null
+        };
+    }
+
+    setupShortActions() {
+        const actions = this.container.querySelector('.shorts-actions');
+        if (!actions) {
+            return;
+        }
+        this.likeButton = actions.querySelector('.like-btn');
+        this.dislikeButton = actions.querySelector('.dislike-btn');
+        this.saveButton = actions.querySelector('.save-btn');
+
+        if (this.likeButton) {
+            this.likeButton.addEventListener('click', () => this.handleShortLike());
+        }
+        if (this.dislikeButton) {
+            this.dislikeButton.addEventListener('click', () => this.handleShortDislike());
+        }
+        if (this.saveButton) {
+            this.saveButton.addEventListener('click', () => this.handleShortSave());
+        }
+
+        this.syncShortActions();
+    }
+
+    syncShortActions() {
+        if (!this.userDataStore) {
+            return;
+        }
+        const reaction = this.userDataStore.getReaction(this.videoid);
+        if (this.likeButton) {
+            this.likeButton.classList.toggle('active', reaction === 'like');
+        }
+        if (this.dislikeButton) {
+            this.dislikeButton.classList.toggle('active', reaction === 'dislike');
+        }
+    }
+
+    handleShortLike() {
+        if (!this.userDataStore) {
+            return;
+        }
+        this.userDataStore.toggleLike(this.videoid, this.getShortMetadata());
+        this.syncShortActions();
+    }
+
+    handleShortDislike() {
+        if (!this.userDataStore) {
+            return;
+        }
+        this.userDataStore.toggleDislike(this.videoid, this.getShortMetadata());
+        this.syncShortActions();
+    }
+
+    handleShortSave() {
+        if (!this.userDataStore) {
+            return;
+        }
+        const name = prompt('Save this Short to which playlist?', 'Favorites');
+        if (name === null) {
+            return;
+        }
+        const playlistName = name.trim() || 'Favorites';
+        this.userDataStore.addToPlaylist(playlistName, this.videoid, this.getShortMetadata());
+        alert(`Short saved to "${playlistName}" on this device.`);
+    }
+
+    recordShortProgress() {
+        if (!this.userDataStore || !this.player || !this.player.duration) {
+            return;
+        }
+        const progress = this.player.currentTime / this.player.duration;
+        this.userDataStore.setWatchProgress(this.videoid, progress, this.getShortMetadata());
+    }
+
+    markShortWatched() {
+        if (this.userDataStore) {
+            this.userDataStore.markWatched(this.videoid, this.getShortMetadata());
         }
     }
 

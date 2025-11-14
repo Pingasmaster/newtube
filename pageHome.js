@@ -79,10 +79,14 @@ class Header extends Component {
 
 // Sidebar Component
 class Sidebar extends Component {
-    constructor() {
+    constructor(onStateChange) {
         super();
         this.state = 'normal'; // normal, reduced, none
-        
+        this.viewportMode = 'desktop';
+        this.isExpanded = true;
+        this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
+        this.resizeHandler = null;
+
         // Items shown in reduced state
         this.reducedItems = [
             { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/></svg>', text: 'Home', active: true },
@@ -116,70 +120,57 @@ class Sidebar extends Component {
             { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M478-240q21 0 35.5-14.5T528-290q0-21-14.5-35.5T478-340q-21 0-35.5 14.5T428-290q0 21 14.5 35.5T478-240Zm-36-154h74q0-33 7.5-52t42.5-52q26-26 41-49.5t15-56.5q0-56-41-86t-97-30q-57 0-92.5 30T342-618l66 26q5-18 22.5-39t53.5-21q32 0 48 17.5t16 38.5q0 20-12 37.5T506-526q-44 39-54 59t-10 73Zm38 314q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>', text: 'Help' }
         ];
         
-        // Set initial state based on screen size
-        this.setInitialState();
-        
-        // Listen for window resize
-        window.addEventListener('resize', () => this.handleResize());
     }
 
     setInitialState() {
-        const width = window.innerWidth;
+        this.viewportMode = this.getViewportMode(window.innerWidth);
+        this.isExpanded = this.viewportMode === 'desktop';
+        this.state = this.deriveState();
+    }
+
+    getViewportMode(width) {
         if (width <= 768) {
-            this.state = 'none'; // Mobile
-        } else if (width <= 1024) {
-            this.state = 'reduced'; // Tablet
-        } else {
-            this.state = 'normal'; // Desktop
+            return 'mobile';
         }
+        if (width <= 1024) {
+            return 'tablet';
+        }
+        return 'desktop';
+    }
+
+    deriveState() {
+        if (this.viewportMode === 'mobile') {
+            return this.isExpanded ? 'normal' : 'none';
+        }
+        if (this.viewportMode === 'tablet') {
+            return this.isExpanded ? 'normal' : 'reduced';
+        }
+        return this.isExpanded ? 'normal' : 'reduced';
     }
 
     handleResize() {
-        const width = window.innerWidth;
-        const oldState = this.state;
-        
-        // Determine valid states for current screen size
-        if (width <= 768) {
-            // Mobile: can only be none or normal
-            if (this.state === 'reduced') {
-                this.state = 'none';
-            }
-        } else if (width <= 1024) {
-            // Tablet: can only be reduced or normal
-            if (this.state === 'none') {
-                this.state = 'reduced';
-            }
-        } else {
-            // Desktop: can only be normal or reduced
-            if (this.state === 'none') {
-                this.state = 'normal';
-            }
+        const newMode = this.getViewportMode(window.innerWidth);
+        if (newMode === this.viewportMode) {
+            return;
         }
-        
-        // Re-render if state changed
-        if (oldState !== this.state) {
-            this.render();
-        }
+
+        this.viewportMode = newMode;
+        this.isExpanded = newMode === 'desktop';
+        this.state = this.deriveState();
+        this.render();
     }
 
     toggle() {
-        const width = window.innerWidth;
-        
-        if (width <= 768) {
-            // Mobile: toggle between none and normal
-            this.state = this.state === 'none' ? 'normal' : 'none';
-        } else if (width <= 1024) {
-            // Tablet: toggle between reduced and normal
-            this.state = this.state === 'reduced' ? 'normal' : 'reduced';
-        } else {
-            // Desktop: toggle between normal and reduced
-            this.state = this.state === 'normal' ? 'reduced' : 'normal';
-        }
-        
+        this.isExpanded = !this.isExpanded;
+        this.state = this.deriveState();
         this.render();
     }
 
     render() {
+        if (!this.element) {
+            return;
+        }
+
         // Clear existing content
         this.element.innerHTML = '';
         
@@ -188,6 +179,7 @@ class Sidebar extends Component {
         
         if (this.state === 'none') {
             this.element.classList.add('state-none');
+            this.notifyStateChange();
             return; // Don't render anything
         } else if (this.state === 'reduced') {
             this.element.classList.add('state-reduced');
@@ -219,19 +211,33 @@ class Sidebar extends Component {
                 this.element.appendChild(sidebarItem);
             }
         });
+
+        this.notifyStateChange();
+    }
+
+    notifyStateChange() {
+        if (typeof this.onStateChange === 'function') {
+            this.onStateChange(this.state);
+        }
     }
 
     init() {
         this.element = document.createElement('aside');
         this.element.className = 'sidebar';
         this.element.id = 'sidebar';
+
+        this.setInitialState();
+        this.resizeHandler = () => this.handleResize();
+        window.addEventListener('resize', this.resizeHandler);
         
         this.render();
         return this.element;
     }
     
     destroy() {
-        window.removeEventListener('resize', () => this.handleResize());
+        if (this.resizeHandler) {
+            window.removeEventListener('resize', this.resizeHandler);
+        }
         super.destroy();
     }
 }
@@ -550,6 +556,7 @@ class MainContent extends Component {
         this.chips = new Chips();
         this.videoGrid = new VideoGrid();
         this.sidebarState = 'normal';
+        this.resizeHandler = null;
     }
 
     init() {
@@ -567,7 +574,8 @@ class MainContent extends Component {
         this.updateMargin();
         
         // Listen for window resize
-        window.addEventListener('resize', () => this.updateMargin());
+        this.resizeHandler = () => this.updateMargin();
+        window.addEventListener('resize', this.resizeHandler);
 
         return this.element;
     }
@@ -579,6 +587,10 @@ class MainContent extends Component {
     }
 
     updateMargin() {
+        if (!this.element) {
+            return;
+        }
+
         const width = window.innerWidth;
         this.element.className = 'content';
         
@@ -608,7 +620,9 @@ class MainContent extends Component {
     }
 
     destroy() {
-        window.removeEventListener('resize', () => this.updateMargin());
+        if (this.resizeHandler) {
+            window.removeEventListener('resize', this.resizeHandler);
+        }
         this.chips.destroy();
         this.videoGrid.destroy();
         super.destroy();
@@ -654,13 +668,24 @@ class HomePage {
         
         // Initialize components
         this.header = new Header(() => this.toggleSidebar());
-        this.sidebar = new Sidebar();
         this.content = new MainContent();
+        this.sidebar = new Sidebar((state) => {
+            if (this.content) {
+                this.content.setSidebarState(state);
+            }
+        });
+
+        const headerElement = this.header.init();
+        const contentElement = this.content.init();
+        const sidebarElement = this.sidebar.init();
 
         // Add to page container
-        pageContainer.appendChild(this.header.init());
-        pageContainer.appendChild(this.sidebar.init());
-        pageContainer.appendChild(this.content.init());
+        pageContainer.appendChild(headerElement);
+        pageContainer.appendChild(sidebarElement);
+        pageContainer.appendChild(contentElement);
+
+        // Ensure the content margin matches the initial sidebar state
+        this.content.setSidebarState(this.sidebar.state);
         
         return pageContainer;
     }

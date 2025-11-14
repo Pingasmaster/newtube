@@ -196,31 +196,31 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/videos", get(list_videos))
-        .route("/api/videos/:id", get(get_video))
-        .route("/api/videos/:id/comments", get(get_video_comments))
-        .route("/api/videos/:id/subtitles", get(list_video_subtitles))
+        .route("/api/videos/{id}", get(get_video))
+        .route("/api/videos/{id}/comments", get(get_video_comments))
+        .route("/api/videos/{id}/subtitles", get(list_video_subtitles))
         .route(
-            "/api/videos/:id/subtitles/:code",
+            "/api/videos/{id}/subtitles/{code}",
             get(download_video_subtitle),
         )
         .route(
-            "/api/videos/:id/thumbnails/:file",
+            "/api/videos/{id}/thumbnails/{file}",
             get(download_video_thumbnail),
         )
-        .route("/api/videos/:id/streams/:format", get(stream_video_file))
+        .route("/api/videos/{id}/streams/{format}", get(stream_video_file))
         .route("/api/shorts", get(list_shorts))
-        .route("/api/shorts/:id", get(get_short))
-        .route("/api/shorts/:id/comments", get(get_video_comments))
-        .route("/api/shorts/:id/subtitles", get(list_short_subtitles))
+        .route("/api/shorts/{id}", get(get_short))
+        .route("/api/shorts/{id}/comments", get(get_video_comments))
+        .route("/api/shorts/{id}/subtitles", get(list_short_subtitles))
         .route(
-            "/api/shorts/:id/subtitles/:code",
+            "/api/shorts/{id}/subtitles/{code}",
             get(download_short_subtitle),
         )
         .route(
-            "/api/shorts/:id/thumbnails/:file",
+            "/api/shorts/{id}/thumbnails/{file}",
             get(download_short_thumbnail),
         )
-        .route("/api/shorts/:id/streams/:format", get(stream_short_file))
+        .route("/api/shorts/{id}/streams/{format}", get(stream_short_file))
         .with_state(state);
 
     let addr = SocketAddr::new(DEFAULT_HOST.parse()?, port);

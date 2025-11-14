@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Command-line helper that downloads whole YouTube channels and builds the
 //! on-disk cache that the ViewTube backend serves.
 //!
@@ -18,6 +20,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 
 const BASE_DIR: &str = "/yt";
 const VIDEOS_SUBDIR: &str = "videos";
@@ -29,6 +33,24 @@ const ARCHIVE_FILE: &str = "download-archive.txt";
 const COOKIES_FILE: &str = "cookies.txt";
 const WWW_ROOT: &str = "/www/newtube.com";
 const METADATA_DB_FILE: &str = "metadata.db";
+
+#[cfg(test)]
+static YT_DLP_STUB: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn yt_dlp_command() -> Command {
+    #[cfg(test)]
+    {
+        if let Some(path) = YT_DLP_STUB.lock().unwrap().clone() {
+            return Command::new(path);
+        }
+    }
+    Command::new("yt-dlp")
+}
+
+#[cfg(test)]
+fn set_ytdlp_stub_path(path: PathBuf) {
+    *YT_DLP_STUB.lock().unwrap() = Some(path);
+}
 
 /// Convenience wrapper around every filesystem location this binary touches.
 struct Paths {
@@ -498,7 +520,7 @@ fn fetch_video_info(
     output_dir: &Path,
     paths: &Paths,
 ) -> Result<VideoInfo> {
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--dump-single-json")
         .arg("--skip-download")
@@ -836,7 +858,7 @@ fn fetch_comments(video_id: &str, video_url: &str, paths: &Paths) -> Result<Vec<
         .with_context(|| format!("creating comments dir {}", comments_dir.display()))?;
 
     let output_pattern = comments_dir.join(video_id);
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--skip-download")
         .arg("--write-comments")
@@ -996,7 +1018,7 @@ fn format_duration(duration: i64) -> String {
 /// Lists all video IDs in a playlist/channel, optionally applying a yt-dlp
 /// `--match-filter` (used to split Shorts vs. regular uploads).
 fn get_video_ids(list_url: &str, filter: Option<&str>) -> Result<Vec<String>> {
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--flat-playlist")
         .arg("--get-id")
@@ -1062,7 +1084,7 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
 
         println!("  Downloading format: {}", format_id);
 
-        let mut command = Command::new("yt-dlp");
+        let mut command = yt_dlp_command();
         command
             .arg("--format")
             .arg(&format_id)
@@ -1101,7 +1123,7 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
 
 /// Wrapper for the metadata/description/thumbnail yt-dlp call.
 fn run_metadata_command(video_url: &str, output_pattern: &str, cookies: &Path) {
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--write-info-json")
         .arg("--write-description")
@@ -1134,7 +1156,7 @@ fn run_subtitle_command(video_id: &str, video_url: &str, subtitles_dir: &Path, c
 
     let output_pattern = target_dir.join(video_id).to_string_lossy().to_string();
 
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--write-sub")
         .arg("--write-auto-sub")
@@ -1168,7 +1190,7 @@ fn run_thumbnail_command(video_id: &str, video_url: &str, thumbnails_dir: &Path,
 
     let output_pattern = target_dir.join(video_id).to_string_lossy().to_string();
 
-    let mut command = Command::new("yt-dlp");
+    let mut command = yt_dlp_command();
     command
         .arg("--write-thumbnail")
         .arg("--skip-download")
@@ -1230,7 +1252,7 @@ fn collect_format_ids(info_json_path: &Path, video_url: &str) -> Result<Vec<Stri
 
     if formats.is_empty() {
         println!("  Could not read formats from metadata, falling back to format listing");
-        let output = Command::new("yt-dlp")
+        let output = yt_dlp_command()
             .arg("-F")
             .arg(video_url)
             .output()
@@ -1287,7 +1309,6 @@ mod tests {
     use anyhow::Result;
     use newtube_tools::metadata::MetadataReader;
     use std::collections::{HashMap, HashSet};
-    use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1411,35 +1432,6 @@ exit 0
             fs::set_permissions(&script_path, perms)?;
         }
         Ok(script_path)
-    }
-
-    struct PathGuard {
-        original: Option<String>,
-    }
-
-    impl PathGuard {
-        fn set_with_stub(dir: &Path) -> Self {
-            let original = env::var("PATH").ok();
-            let new_path = if let Some(ref value) = original {
-                format!("{}:{}", dir.display(), value)
-            } else {
-                dir.display().to_string()
-            };
-            unsafe {
-                env::set_var("PATH", new_path);
-            }
-            Self { original }
-        }
-    }
-
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            if let Some(ref value) = self.original {
-                unsafe {
-                    env::set_var("PATH", value);
-                }
-            }
-        }
     }
 
     #[test]
@@ -1651,8 +1643,8 @@ exit 0
     #[test]
     fn process_entry_refreshes_metadata_even_when_archived() -> Result<()> {
         let (temp, paths) = temp_paths();
-        let _stub = install_ytdlp_stub(temp.path())?;
-        let _guard = PathGuard::set_with_stub(temp.path());
+        let stub = install_ytdlp_stub(temp.path())?;
+        set_ytdlp_stub_path(stub);
         paths.prepare()?;
 
         let media_dir = paths.media_dir(MediaKind::Video).join("alpha");
@@ -1686,8 +1678,8 @@ exit 0
     #[test]
     fn fetch_comments_dedupes_and_sets_flags() -> Result<()> {
         let (temp, paths) = temp_paths();
-        let _stub = install_ytdlp_stub(temp.path())?;
-        let _guard = PathGuard::set_with_stub(temp.path());
+        let stub = install_ytdlp_stub(temp.path())?;
+        set_ytdlp_stub_path(stub);
         let comments = fetch_comments("alpha", "https://youtube.com/watch?v=alpha", &paths)?;
         assert_eq!(comments.len(), 2);
         assert!(

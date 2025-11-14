@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Helper binary that re-runs the downloader for every channel already present
 //! on disk. Acts like a nightly cron job.
 
@@ -10,6 +12,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 const BASE_DIR: &str = "/yt";
@@ -157,7 +161,24 @@ fn canonicalize_channel_url(url: &str) -> String {
 
 /// Finds the `download_channel` executable either via Cargo's env var or by
 /// looking next to the current binary (assuming `cargo install`/`cargo build`).
+#[cfg(test)]
+static DOWNLOAD_CHANNEL_STUB: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_download_channel_stub(path: PathBuf) {
+    *DOWNLOAD_CHANNEL_STUB.lock().unwrap() = Some(path);
+}
+
 fn find_download_channel_executable() -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(path) = DOWNLOAD_CHANNEL_STUB.lock().unwrap().clone() {
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
     if let Ok(path) = env::var("CARGO_BIN_EXE_download_channel") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -216,18 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn find_download_channel_uses_env_var() -> Result<()> {
+    fn find_download_channel_uses_stub_path() -> Result<()> {
         let temp = tempdir()?;
         let fake = temp.path().join("download_channel");
         File::create(&fake)?;
-        unsafe {
-            env::set_var("CARGO_BIN_EXE_download_channel", &fake);
-        }
+        set_download_channel_stub(fake.clone());
         let path = find_download_channel_executable()?;
         assert_eq!(path, fake);
-        unsafe {
-            env::remove_var("CARGO_BIN_EXE_download_channel");
-        }
         Ok(())
     }
 }

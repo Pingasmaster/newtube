@@ -15,11 +15,13 @@ git clone https://github.com/Pingasmaster/viewtube.git && cd viewtube && cargo b
 ```
 
 This software needs a `media root` and a `www root` directory, it will ask you where you want them while you install the software. By default they are `/yt/` for the media and `/www/newtube.com` for `www root`. During the same prompt session the installer also asks which TCP port the backend should listen on (stored as `NEWTUBE_PORT`, default `8080`). All three answers live in the default config file `/etc/viewtube-env` so future runs automatically pick them up.
+
 Nginx is installed if it's not already and the correct config for the website is automatically put there when you run the `./installer`.
 
 ## Using the Rust Backend
 
 Compile and get the binaries in the current directory (change `MEDIA_ROOT`/`WWW_ROOT`/`NEWTUBE_PORT` in `/etc/viewtube-env` *before* running the `setup-script.sh` helper if you want something else than `/yt` + `/www/newtube.com` + `8080`):
+
 To compile manually:
 
 ```bash
@@ -31,9 +33,13 @@ cp target/release/installer target/release/backend target/release/download_chann
 ```
 
 `installer` can be used to install, uninstall, reinstall (manual forced update), and clean the www root of build artifacts. It is meant to run once, at the first install, and then never again except if you need to clean the www-root directory and remove junk files made by a manual build maybe.
-It check sif you have nginx and screen installed, prompt to install them if not, and puts the good nginx config in place if you wish (it asks for the domain name). It then clones the repo to the `www root` and installs a systemd service for the updater, which is a bash script that pulls the git repo under `www root` and sees if theres any update, if so it rebuilds the binaries and replace them and changes the software version in the config file. Its run at 3AM every single day. It also runs `routine_update` to download any new content from any channel already downloaded.
+
+It checks if you have nginx and screen installed, prompt to install them if not, and puts the good nginx config in place if you wish (it asks for the domain name). It then clones the repo to the `www root` and installs a systemd service for the updater, which is a bash script that pulls the git repo under `www root` and sees if theres any update, if so it rebuilds the binaries and replace them and changes the software version in the config file. Its run at 3AM every single day. It also runs `routine_update` to download any new content from any channel already downloaded.
+
 `backend` is the backend api. Takes things under the media root directory (/yt/ by default). It's automatically run in the background by the command `screen` if you used the installer. You can also run it manually; by default it reads `MEDIA_ROOT`, `WWW_ROOT`, and `NEWTUBE_PORT` from `/etc/viewtube-env` (override with `--config`, `--media-root`, or `--port` if needed).
+
 `download_channel` takes a youtube channel full url and downloads every single video and short from that channel. It also downloads the comments of these videos alongside metadata and subtitles. Like the backend, it prefers loading `MEDIA_ROOT`/`WWW_ROOT` from `/etc/viewtube-env` unless you explicitly pass overrides.
+
 `routine_update` takes every single channel you already downloaded and retries to download them all, but remembers thanks to an archive what videos were already downloaded. Theres a metadata update mode which only redownloads metadata and subtitles and comments from a video which you can trigger manually. Right now the metadata mode is never trigger automatically. The binary now shares the same `--config` parsing logic so it picks up the exact same directories that the downloader/backends use.
 
 This software needs a `media root` and a `www root` directory, which are used to store youtube videos/shorts/metadata and serve web content respectively. The `www root` is also by default the place where the github will be cloned into by `installer`.
@@ -133,11 +139,6 @@ The software is not meant to be run manually like this though. A simple executio
   Combine it with a scheduler (cron/systemd timers) to keep your library synced overnight without manual intervention.
 
 All three utilities share the same Rust crate (`newtube_tools`), so adding new metadata fields only requires updating the structs once.
-
-## Deployment helper scripts
-
-- `setup-software.sh` (root only) wires the whole stack onto a box: it reads/writes `/etc/viewtube-env`, respects `MEDIA_ROOT`/`WWW_ROOT`, generates the helper `viewtube-update-build-run.sh` under the media root, installs the `software-updater.service`/`.timer`, runs `cleanup-repo.sh`, and copies fresh binaries to the media root. On version bumps (Cargo `version` change) it rewrites the config and re-runs itself so the helper script living under `/yt` picks up the update automatically.
-- `cleanup-repo.sh` scrubs deployment-only files after each sync so the served tree contains only the assets + binaries you actually need.
 
 # Tests
 

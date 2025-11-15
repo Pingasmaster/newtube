@@ -9,7 +9,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -399,6 +399,7 @@ async fn download_short_thumbnail(
 }
 
 async fn download_thumbnail(state: AppState, id: String, file: String) -> ApiResult<Response> {
+    ensure_safe_filename(&file)?;
     let path = state.files.thumbnails.join(&id).join(&file);
     stream_file(path, None).await
 }
@@ -621,6 +622,19 @@ impl AppState {
 /// is the only piece users need to specify.
 fn source_key(source: &VideoSource) -> Option<String> {
     source.url.rsplit('/').next().map(|value| value.to_owned())
+}
+
+/// Validates that the provided filename cannot escape the per-video directory.
+fn ensure_safe_filename(name: &str) -> ApiResult<()> {
+    if name.is_empty()
+        || Path::new(name)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiError::not_found("file not found"));
+    }
+
+    Ok(())
 }
 
 async fn stream_file(path: PathBuf, mime: Option<Mime>) -> ApiResult<Response> {
@@ -899,6 +913,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn download_thumbnail_serves_local_files() {
+        let ctx = BackendTestContext::new();
+        let thumb_dir = ctx.state.files.thumbnails.join("alpha");
+        std::fs::create_dir_all(&thumb_dir).unwrap();
+        std::fs::write(thumb_dir.join("poster.png"), b"PNG").unwrap();
+
+        let response = download_thumbnail(ctx.state.clone(), "alpha".into(), "poster.png".into())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"PNG");
+    }
+
+    #[tokio::test]
+    async fn download_thumbnail_rejects_path_traversal() {
+        let ctx = BackendTestContext::new();
+        let err = download_thumbnail(ctx.state.clone(), "alpha".into(), "../secret.txt".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

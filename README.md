@@ -6,12 +6,20 @@ There is no account system, but history and likes/dislikes still work. You can s
 
 The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
 
+## Install
+
+A one-liner will install everything you need, including auto-update scripts, and launch the backend. You just have to wait for the users to come and it will start downloading content automatically or download things yourself using `/yt/download_channel https://youtube.com/@LinustechTips`. Do `cat setup-software.sh` before running it (especially as root)! 
+
+```bash
+git clone https://github.com/Pingasmaster/viewtube.git && sudo ./viewtube/setup-software.sh && rm -rf ./viewtube
+```
+
 ## Using the Rust Backend
 
 Compile and get the binaries in the current directory (change `MEDIA_ROOT`/`WWW_ROOT` in /etc/viewtube-env BEFORE running the `setup-script.sh` the setup script if you want something else than `/yt` + `/www/newtube.com`):
 To compile manually:
 
-```
+```bash
 cargo clean && cargo build --release
 cp target/release/backend target/release/download_channel target/release/routine_update .
 ```

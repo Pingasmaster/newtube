@@ -43,22 +43,25 @@ export PATH="$PATH:/root/.cargo/bin:/usr/local/bin"
 
 APP_DIR="$WWW_ROOT"
 
+cd "$APP_DIR"
+
 echo "[*] Cloning repo..."
-rm -rf "$APP_DIR"
-git clone "$REPO_URL" "$APP_DIR"
+git pull
+#rm -rf "$APP_DIR"
+#git clone "$REPO_URL" "$APP_DIR"
 
 cd "$APP_DIR"
 ./cleanup-repo.sh
-CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
-if [[ "$APP_VERSION" != "$CARGO_VERSION" ]]; then
-    echo "Detected version change ($APP_VERSION -> $CARGO_VERSION); refreshing $CONFIG_FILE..."
-    cat <<EOF > "$CONFIG_FILE"
-MEDIA_ROOT="$MEDIA_ROOT"
-WWW_ROOT="$WWW_ROOT"
-APP_VERSION="$CARGO_VERSION"
-EOF
-fi
-rm -f cleanup-repo.sh setup-software.sh
+#CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+#if [[ "$APP_VERSION" != "$CARGO_VERSION" ]]; then
+#    echo "Detected version change ($APP_VERSION -> $CARGO_VERSION); refreshing ..."
+#    cat <<EOF > "$CONFIG_FILE"
+#MEDIA_ROOT="$MEDIA_ROOT"
+#WWW_ROOT="$WWW_ROOT"
+#APP_VERSION="$CARGO_VERSION"
+#EOF
+#fi
+#rm -f cleanup-repo.sh setup-software.sh
 
 echo "[*] Building with cargo (release)..."
 cargo build --release
@@ -119,9 +122,9 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl start software-updater.service
-systemctl enable --now software-updater.timer
+systemctl restart software-updater.service
+systemctl enable software-updater.timer
 # Check status
-systemctl status software-updater.timer
+#systemctl status software-updater.timer
 # Validate when it last/next ran
-systemctl list-timers | grep software-updater
+#systemctl list-timers | grep software-updater

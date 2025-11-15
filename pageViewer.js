@@ -72,6 +72,105 @@ class BaseViewer {
         }
         return 'video/mp4';
     }
+
+    sortSources(sources = []) {
+        if (!Array.isArray(sources)) {
+            return [];
+        }
+        return [...sources].sort((a, b) => {
+            const qualityA = this.getSourceQualityValue(a);
+            const qualityB = this.getSourceQualityValue(b);
+            return qualityB - qualityA;
+        });
+    }
+
+    sanitizeMediaUrl(url) {
+        if (!url || typeof url !== 'string') {
+            return null;
+        }
+        const trimmed = url.trim();
+        if (!trimmed) {
+            return null;
+        }
+        const lower = trimmed.toLowerCase();
+        const isHttp = lower.startsWith('http://') || lower.startsWith('https://');
+        const isRelative = trimmed.startsWith('/');
+        const isBlob = lower.startsWith('blob:');
+        if (!isHttp && !isRelative && !isBlob) {
+            return null;
+        }
+        return trimmed;
+    }
+
+    normalizeLanguageCode(value) {
+        if (!value || typeof value !== 'string') {
+            return '';
+        }
+        const normalized = value.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 16);
+        return normalized;
+    }
+
+    prepareMediaElement(player, sources = [], subtitleTracks = []) {
+        if (!player) {
+            return;
+        }
+        while (player.firstChild) {
+            player.removeChild(player.firstChild);
+        }
+        this.appendSources(player, sources);
+        this.appendTracks(player, subtitleTracks);
+    }
+
+    appendSources(player, sources) {
+        if (!player || !Array.isArray(sources)) {
+            return;
+        }
+        const sorted = this.sortSources(sources);
+        sorted.forEach((source) => {
+            const safeUrl = this.sanitizeMediaUrl(source?.url);
+            if (!safeUrl) {
+                return;
+            }
+            const element = document.createElement('source');
+            element.src = safeUrl;
+            const mime = this.getSourceMimeType(source);
+            if (mime) {
+                element.type = mime;
+            }
+            const label = this.getSourceLabel(source);
+            if (label) {
+                element.setAttribute('label', label);
+            }
+            player.appendChild(element);
+        });
+    }
+
+    appendTracks(player, tracks) {
+        if (!player || !Array.isArray(tracks)) {
+            return;
+        }
+        tracks.forEach((track) => {
+            const safeUrl = this.sanitizeMediaUrl(track?.url);
+            if (!safeUrl) {
+                return;
+            }
+            const element = document.createElement('track');
+            element.kind = 'subtitles';
+            element.src = safeUrl;
+            const lang = this.normalizeLanguageCode(track?.code);
+            if (lang) {
+                element.srclang = lang;
+            }
+            const label =
+                typeof track?.name === 'string' && track.name.trim()
+                    ? track.name.trim()
+                    : lang
+                    ? lang.toUpperCase()
+                    : 'Subtitles';
+            element.label = label;
+            player.appendChild(element);
+        });
+    }
 }
 
 // Regular Video Viewer
@@ -109,10 +208,7 @@ class VideoViewer extends BaseViewer {
             <div class="viewer-layout">
                 <div class="viewer-main">
                     <div class="video-player">
-                        <video id="videoPlayer" controls>
-                            ${this.renderSources()}
-                            ${this.renderSubtitles()}
-                        </video>
+                        <video id="videoPlayer" controls></video>
                     </div>
                     <div class="video-info">
                         <h1 class="video-title">${this.escapeHtml(this.videoData.title)}</h1>
@@ -165,9 +261,19 @@ class VideoViewer extends BaseViewer {
         `;
 
         this.container.appendChild(pageContainer);
+        this.populateVideoPlayerMedia();
         this.setupPlayer();
         this.setupActions();
         this.renderComments();
+    }
+
+    populateVideoPlayerMedia() {
+        const player = document.getElementById('videoPlayer');
+        if (!player) {
+            return;
+        }
+        const tracks = Array.isArray(this.subtitles?.languages) ? this.subtitles.languages : [];
+        this.prepareMediaElement(player, this.videoData?.sources || [], tracks);
     }
 
     getVideoMetadata() {
@@ -278,33 +384,6 @@ class VideoViewer extends BaseViewer {
         } else {
             alert('Subscription removed from this device.');
         }
-    }
-
-    renderSources() {
-        if (!this.videoData.sources || this.videoData.sources.length === 0) {
-            return '';
-        }
-
-        // Sort sources by quality (highest first)
-        const sortedSources = [...this.videoData.sources].sort((a, b) => {
-            const qualityA = this.getSourceQualityValue(a);
-            const qualityB = this.getSourceQualityValue(b);
-            return qualityB - qualityA;
-        });
-
-        return sortedSources.map(source => 
-            `<source src="${source.url}" type="${this.getSourceMimeType(source)}" label="${this.getSourceLabel(source)}">`
-        ).join('');
-    }
-
-    renderSubtitles() {
-        if (!this.subtitles || !this.subtitles.languages) {
-            return '';
-        }
-
-        return this.subtitles.languages.map(sub => 
-            `<track kind="subtitles" src="${sub.url}" srclang="${sub.code}" label="${sub.name}">`
-        ).join('');
     }
 
     setupPlayer() {
@@ -452,9 +531,7 @@ class ShortsViewer extends BaseViewer {
         pageContainer.innerHTML = `
             <div class="shorts-viewer">
                 <div class="shorts-video-container">
-                    <video id="shortsPlayer" loop>
-                        ${this.renderSources()}
-                    </video>
+                    <video id="shortsPlayer" loop></video>
                     <div class="shorts-overlay">
                         <div class="shorts-info">
                             <div class="shorts-author">@${this.escapeHtml(this.videoData.author)}</div>
@@ -492,26 +569,17 @@ class ShortsViewer extends BaseViewer {
         `;
 
         this.container.appendChild(pageContainer);
+        this.populateShortsPlayerMedia();
         this.setupPlayer();
         this.setupShortActions();
     }
 
-    renderSources() {
-        if (!this.videoData.sources || this.videoData.sources.length === 0) {
-            return '';
+    populateShortsPlayerMedia() {
+        const player = document.getElementById('shortsPlayer');
+        if (!player) {
+            return;
         }
-
-        const sortedSources = [...this.videoData.sources].sort((a, b) => {
-            const qualityA = this.getSourceQualityValue(a);
-            const qualityB = this.getSourceQualityValue(b);
-            return qualityB - qualityA;
-        });
-
-        return sortedSources
-            .map((source) =>
-                `<source src="${source.url}" type="${this.getSourceMimeType(source)}" label="${this.getSourceLabel(source)}">`
-            )
-            .join('');
+        this.prepareMediaElement(player, this.videoData?.sources || [], []);
     }
 
     setupPlayer() {

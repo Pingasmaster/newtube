@@ -399,6 +399,9 @@ async fn download_short_subtitle(
 }
 
 async fn download_subtitle(state: AppState, id: String, code: String) -> ApiResult<Response> {
+    ensure_safe_path_segment(&id)?;
+    ensure_safe_path_segment(&code)?;
+
     let subtitles = state
         .get_subtitles(&id)
         .await?
@@ -438,7 +441,8 @@ async fn download_short_thumbnail(
 }
 
 async fn download_thumbnail(state: AppState, id: String, file: String) -> ApiResult<Response> {
-    ensure_safe_filename(&file)?;
+    ensure_safe_path_segment(&id)?;
+    ensure_safe_path_segment(&file)?;
     let path = state.files.thumbnails.join(&id).join(&file);
     stream_file(path, None).await
 }
@@ -463,6 +467,9 @@ async fn stream_media(
     id: String,
     format: String,
 ) -> ApiResult<Response> {
+    ensure_safe_path_segment(&id)?;
+    ensure_safe_path_segment(&format)?;
+
     // We load metadata first so we can map the requested format slug to a file
     // path and mime type before hitting the disk.
     let record = state.get_media(category, &id).await?;
@@ -663,10 +670,10 @@ fn source_key(source: &VideoSource) -> Option<String> {
     source.url.rsplit('/').next().map(|value| value.to_owned())
 }
 
-/// Validates that the provided filename cannot escape the per-video directory.
-fn ensure_safe_filename(name: &str) -> ApiResult<()> {
-    if name.is_empty()
-        || Path::new(name)
+/// Validates that a single dynamic path segment never escapes its base folder.
+fn ensure_safe_path_segment(value: &str) -> ApiResult<()> {
+    if value.is_empty()
+        || Path::new(value)
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {

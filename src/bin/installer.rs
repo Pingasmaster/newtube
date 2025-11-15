@@ -3,11 +3,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgGroup, Parser};
 use newtube_tools::config::{
-    DEFAULT_CONFIG_PATH, DEFAULT_NEWTUBE_PORT, EnvConfig, read_env_config,
+    DEFAULT_CONFIG_PATH, DEFAULT_NEWTUBE_HOST, DEFAULT_NEWTUBE_PORT, EnvConfig, read_env_config,
 };
 use std::{
     env, fs,
     io::{self, Write},
+    net::IpAddr,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
@@ -19,7 +20,13 @@ const HELPER_SCRIPT_NAME: &str = "viewtube-update-build-run.sh";
 const SOFTWARE_SERVICE: &str = "software-updater.service";
 const SOFTWARE_TIMER: &str = "software-updater.timer";
 const NGINX_SERVICE: &str = "nginx";
-const SCREEN_COMMAND: &str = "screen";
+const BACKEND_SERVICE: &str = "viewtube-backend.service";
+const ROUTINE_SERVICE: &str = "viewtube-routine.service";
+const VIEWTUBE_GROUP: &str = "viewtube";
+const BACKEND_USER: &str = "viewtube-backend";
+const DOWNLOADER_USER: &str = "viewtube-downloader";
+const BACKEND_HOME: &str = "/var/lib/viewtube-backend";
+const DOWNLOADER_HOME: &str = "/var/lib/viewtube-downloader";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Install and manage ViewTube services.")]
@@ -62,6 +69,12 @@ struct Cli {
     )]
     port: Option<u16>,
     #[arg(
+        long = "host",
+        value_name = "IP",
+        help = "Override the backend listen address (default 127.0.0.1)"
+    )]
+    host: Option<String>,
+    #[arg(
         long = "domain",
         value_name = "NAME",
         help = "Domain name serving ViewTube (e.g., example.com)"
@@ -91,7 +104,8 @@ fn main() -> Result<()> {
     let existing_env = read_env_config(&cli.config)?;
     let needs_prompt = !cli.uninstall || cli.reinstall;
     let port_arg = cli.port;
-    let (media_root, www_root, newtube_port) = if needs_prompt {
+    let host_arg = cli.host.clone();
+    let (media_root, www_root, newtube_port, newtube_host) = if needs_prompt {
         (
             resolve_media_root(
                 cli.media_dir.clone(),
@@ -108,6 +122,13 @@ fn main() -> Result<()> {
                 existing_env.as_ref().and_then(|cfg| cfg.newtube_port),
                 cli.assume_yes,
             )?,
+            resolve_host(
+                host_arg.clone(),
+                existing_env
+                    .as_ref()
+                    .and_then(|cfg| cfg.newtube_host.clone()),
+                cli.assume_yes,
+            )?,
         )
     } else {
         (
@@ -122,6 +143,14 @@ fn main() -> Result<()> {
             port_arg
                 .or_else(|| existing_env.as_ref().and_then(|cfg| cfg.newtube_port))
                 .unwrap_or(DEFAULT_NEWTUBE_PORT),
+            host_arg
+                .clone()
+                .or_else(|| {
+                    existing_env
+                        .as_ref()
+                        .and_then(|cfg| cfg.newtube_host.clone())
+                })
+                .unwrap_or_else(|| DEFAULT_NEWTUBE_HOST.to_string()),
         )
     };
     let app_version = determine_version(&repo_root)?;
@@ -142,6 +171,7 @@ fn main() -> Result<()> {
             media_root,
             www_root,
             newtube_port,
+            newtube_host: newtube_host.clone(),
             config_path: cli.config.clone(),
             domain_name: domain.expect("domain required"),
             app_version,
@@ -160,6 +190,7 @@ fn main() -> Result<()> {
         media_root,
         www_root,
         newtube_port,
+        newtube_host,
         config_path: cli.config,
         domain_name: domain.expect("domain required"),
         app_version,
@@ -174,6 +205,7 @@ struct InstallConfig {
     media_root: PathBuf,
     www_root: PathBuf,
     newtube_port: u16,
+    newtube_host: String,
     config_path: PathBuf,
     domain_name: String,
     app_version: String,
@@ -187,8 +219,8 @@ fn install(cfg: InstallConfig) -> Result<()> {
     fs::create_dir_all(&cfg.www_root)
         .with_context(|| format!("Creating www dir {}", cfg.www_root.display()))?;
 
+    ensure_service_accounts(&cfg)?;
     ensure_nginx_installed(cfg.assume_yes)?;
-    ensure_screen_installed(cfg.assume_yes)?;
     deploy_nginx_config(&cfg.domain_name, &cfg.www_root, cfg.assume_yes)?;
 
     write_env_config(&cfg)?;
@@ -196,6 +228,7 @@ fn install(cfg: InstallConfig) -> Result<()> {
     install_systemd_units(&cfg)?;
 
     run_command("systemctl", &["daemon-reload"])?;
+    run_command("systemctl", &["enable", BACKEND_SERVICE])?;
     run_command("systemctl", &["enable", "--now", SOFTWARE_TIMER])?;
 
     run_helper_script(&cfg.media_root.join(HELPER_SCRIPT_NAME))?;
@@ -209,10 +242,14 @@ fn uninstall(media_root: &Path, config_path: &Path) -> Result<()> {
     let script_path = media_root.join(HELPER_SCRIPT_NAME);
     let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_TIMER]);
     let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_SERVICE]);
+    let _ = run_command_allow_fail("systemctl", &["disable", "--now", BACKEND_SERVICE]);
+    let _ = run_command_allow_fail("systemctl", &["disable", "--now", ROUTINE_SERVICE]);
 
     let systemd_dir = PathBuf::from("/etc/systemd/system");
     remove_path_if_exists(&systemd_dir.join(SOFTWARE_SERVICE))?;
     remove_path_if_exists(&systemd_dir.join(SOFTWARE_TIMER))?;
+    remove_path_if_exists(&systemd_dir.join(BACKEND_SERVICE))?;
+    remove_path_if_exists(&systemd_dir.join(ROUTINE_SERVICE))?;
 
     run_command("systemctl", &["daemon-reload"])?;
 
@@ -272,16 +309,21 @@ fn ensure_root() -> Result<()> {
 
 fn write_env_config(cfg: &InstallConfig) -> Result<()> {
     let content = format!(
-        "MEDIA_ROOT=\"{}\"\nWWW_ROOT=\"{}\"\nNEWTUBE_PORT=\"{}\"\nAPP_VERSION=\"{}\"\nDOMAIN_NAME=\"{}\"\n",
+        "MEDIA_ROOT=\"{}\"\nWWW_ROOT=\"{}\"\nNEWTUBE_PORT=\"{}\"\nNEWTUBE_HOST=\"{}\"\nAPP_VERSION=\"{}\"\nDOMAIN_NAME=\"{}\"\n",
         cfg.media_root.display(),
         cfg.www_root.display(),
         cfg.newtube_port,
+        cfg.newtube_host,
         cfg.app_version,
         cfg.domain_name
     );
     fs::write(&cfg.config_path, content)
         .with_context(|| format!("Writing {}", cfg.config_path.display()))?;
-    fs::set_permissions(&cfg.config_path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&cfg.config_path, fs::Permissions::from_mode(0o640))?;
+    let owner = format!("root:{}", VIEWTUBE_GROUP);
+    let target = cfg.config_path.to_string_lossy().into_owned();
+    let args = [owner.as_str(), target.as_str()];
+    run_command("chown", &args)?;
     Ok(())
 }
 
@@ -368,6 +410,33 @@ fn resolve_port(cli_value: Option<u16>, existing: Option<u16>, assume_yes: bool)
     prompt_for_port(existing)
 }
 
+fn resolve_host(
+    cli_value: Option<String>,
+    existing: Option<String>,
+    assume_yes: bool,
+) -> Result<String> {
+    if let Some(host) = cli_value {
+        return validate_host(&host);
+    }
+    if let Some(ref existing_host) = existing
+        && (assume_yes
+            || prompt_yes_no(
+                &format!("Use detected NEWTUBE_HOST '{existing_host}' (backend API binds here)?"),
+                true,
+            )?)
+    {
+        return Ok(existing_host.clone());
+    }
+    if assume_yes {
+        log_info(format!(
+            "Using default NEWTUBE_HOST {} due to --assume-yes",
+            DEFAULT_NEWTUBE_HOST
+        ));
+        return Ok(DEFAULT_NEWTUBE_HOST.to_string());
+    }
+    prompt_for_host(existing)
+}
+
 fn prompt_for_media_root(default: Option<PathBuf>) -> Result<PathBuf> {
     println!();
     println!(
@@ -414,6 +483,42 @@ fn prompt_for_port(default: Option<u16>) -> Result<u16> {
             Err(_) => println!("Please enter a valid number between 1 and 65535."),
         }
     }
+}
+
+fn prompt_for_host(default: Option<String>) -> Result<String> {
+    println!();
+    println!("NEWTUBE_HOST controls which network interface the backend binds to.");
+    println!(
+        "Use 127.0.0.1 when placing nginx in front of the API so it stays unreachable from the public internet."
+    );
+    let suggested = default.unwrap_or_else(|| DEFAULT_NEWTUBE_HOST.to_string());
+    loop {
+        print!("Enter the listen address for the backend [{}]: ", suggested);
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            bail!("Failed to read listen address");
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(suggested.clone());
+        }
+        match validate_host(trimmed) {
+            Ok(value) => return Ok(value),
+            Err(err) => eprintln!("{err}"),
+        }
+    }
+}
+
+fn validate_host(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Listen address cannot be empty");
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .with_context(|| format!("Invalid listen address '{trimmed}'"))?;
+    Ok(trimmed.to_string())
 }
 
 fn prompt_for_path(prompt: &str, default_path: PathBuf) -> Result<PathBuf> {
@@ -531,6 +636,59 @@ fn ensure_nginx_installed(assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn ensure_service_accounts(cfg: &InstallConfig) -> Result<()> {
+    ensure_group_exists(VIEWTUBE_GROUP)?;
+    ensure_user_exists(BACKEND_USER, VIEWTUBE_GROUP, BACKEND_HOME)?;
+    ensure_user_exists(DOWNLOADER_USER, VIEWTUBE_GROUP, DOWNLOADER_HOME)?;
+    apply_media_permissions(&cfg.media_root)?;
+    Ok(())
+}
+
+fn ensure_group_exists(name: &str) -> Result<()> {
+    match Command::new("getent").args(["group", name]).status() {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(_) | Err(_) => {}
+    }
+    run_command("groupadd", &["--system", name])
+}
+
+fn ensure_user_exists(user: &str, group: &str, home: &str) -> Result<()> {
+    match Command::new("id").args(["-u", user]).status() {
+        Ok(status) if status.success() => {
+            fs::create_dir_all(home).with_context(|| format!("Creating home directory {home}"))?;
+            return Ok(());
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    fs::create_dir_all(home).with_context(|| format!("Creating home directory {home}"))?;
+    let home_owned = home.to_string();
+    let args = [
+        "--system",
+        "--create-home",
+        "--home",
+        home_owned.as_str(),
+        "--shell",
+        "/usr/sbin/nologin",
+        "--gid",
+        group,
+        user,
+    ];
+    run_command("useradd", &args)
+}
+
+fn apply_media_permissions(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let owner = format!("{}:{}", DOWNLOADER_USER, VIEWTUBE_GROUP);
+    let target = path.to_string_lossy().into_owned();
+    let chown_args = ["-R", owner.as_str(), target.as_str()];
+    run_command("chown", &chown_args)?;
+    let chmod_args = ["-R", "g+rwX", target.as_str()];
+    run_command("chmod", &chmod_args)
+}
+
 fn service_exists(name: &str) -> Result<bool> {
     let stdout = run_command_capture("systemctl", &["list-unit-files", "--type=service", "--all"])?;
     let needle = format!("{name}.service");
@@ -566,48 +724,6 @@ fn install_nginx_package() -> Result<()> {
         other => bail!("Unsupported package manager {other}"),
     }
     run_command("systemctl", &["enable", "--now", NGINX_SERVICE])?;
-    Ok(())
-}
-
-fn ensure_screen_installed(assume_yes: bool) -> Result<()> {
-    if command_exists(SCREEN_COMMAND) {
-        log_info("screen command detected");
-        return Ok(());
-    }
-    log_info("screen command not detected");
-    if assume_yes || prompt_yes_no("Install screen via package manager?", false)? {
-        install_screen_package().context("Unable to install screen")?;
-    } else {
-        bail!("screen is required for setup");
-    }
-    Ok(())
-}
-
-fn install_screen_package() -> Result<()> {
-    let manager = detect_package_manager()
-        .ok_or_else(|| anyhow!("Could not detect a supported package manager"))?;
-    match manager {
-        "apt-get" => {
-            run_command("apt-get", &["update"])?;
-            run_command("apt-get", &["install", "-y", SCREEN_COMMAND])?;
-        }
-        "apt" => {
-            run_command("apt", &["update"])?;
-            run_command("apt", &["install", "-y", SCREEN_COMMAND])?;
-        }
-        "dnf" => run_command("dnf", &["install", "-y", SCREEN_COMMAND])?,
-        "yum" => run_command("yum", &["install", "-y", SCREEN_COMMAND])?,
-        "pacman" => run_command("pacman", &["-Sy", "--noconfirm", SCREEN_COMMAND])?,
-        "apk" => {
-            run_command("apk", &["update"])?;
-            run_command("apk", &["add", SCREEN_COMMAND])?;
-        }
-        "zypper" => {
-            run_command("zypper", &["refresh"])?;
-            run_command("zypper", &["install", "-y", SCREEN_COMMAND])?;
-        }
-        other => bail!("Unsupported package manager {other}"),
-    }
     Ok(())
 }
 
@@ -699,9 +815,15 @@ if [[ -z "${NEWTUBE_PORT:-}" ]]; then
     NEWTUBE_PORT="8080"
 fi
 
+if [[ -z "${NEWTUBE_HOST:-}" ]]; then
+    NEWTUBE_HOST="127.0.0.1"
+fi
+
 REPO_URL="https://github.com/Pingasmaster/viewtube.git"
-SCREEN_NAME_ROUTINEUPDATE="routineupdate"
-SCREEN_NAME_BACKEND="backend"
+BACKEND_SERVICE="viewtube-backend.service"
+ROUTINE_SERVICE="viewtube-routine.service"
+SERVICE_GROUP="viewtube"
+DOWNLOADER_USER="viewtube-downloader"
 NGINX_SERVICE="nginx"
 
 export PATH="$PATH:/root/.cargo/bin:/usr/local/bin"
@@ -735,13 +857,14 @@ if [[ "$APP_VERSION" != "$CARGO_VERSION" ]]; then
 MEDIA_ROOT="$MEDIA_ROOT"
 WWW_ROOT="$WWW_ROOT"
 NEWTUBE_PORT="$NEWTUBE_PORT"
+NEWTUBE_HOST="$NEWTUBE_HOST"
 APP_VERSION="$CARGO_VERSION"
 DOMAIN_NAME="$DOMAIN_NAME"
 EOF
     INSTALLER_BIN="$APP_DIR/target/release/installer"
     if [[ -x "$INSTALLER_BIN" ]]; then
         echo "[*] Detected version change ($APP_VERSION -> $CARGO_VERSION); rerunning installer..."
-        exec "$INSTALLER_BIN" -y --config "$CONFIG_FILE" --media-dir "$MEDIA_ROOT" --www-dir "$WWW_ROOT" --port "$NEWTUBE_PORT" --domain "$DOMAIN_NAME"
+        exec "$INSTALLER_BIN" -y --config "$CONFIG_FILE" --media-dir "$MEDIA_ROOT" --www-dir "$WWW_ROOT" --port "$NEWTUBE_PORT" --host "$NEWTUBE_HOST" --domain "$DOMAIN_NAME"
     else
         echo "Missing $INSTALLER_BIN; cannot re-run installer." >&2
         exit 1
@@ -752,19 +875,15 @@ echo "[*] Building with cargo (release)..."
 cargo build --release
 cp target/release/backend target/release/download_channel target/release/routine_update "$MEDIA_ROOT" && cargo clean
 
-echo "[*] Stopping existing screen session for backend (if any)..."
-if screen -list | grep -q "\.$SCREEN_NAME_BACKEND"; then
-    screen -S "$SCREEN_NAME_BACKEND" -X quit || true
-fi
+echo "[*] Resetting media directory permissions..."
+chown -R "$DOWNLOADER_USER:$SERVICE_GROUP" "$MEDIA_ROOT"
+chmod -R g+rwX "$MEDIA_ROOT"
 
-echo "[*] Stopping existing screen session for routine update (if any)..."
-if screen -list | grep -q "\.$SCREEN_NAME_ROUTINEUPDATE"; then
-    screen -S "$SCREEN_NAME_ROUTINEUPDATE" -X quit || true
-fi
+echo "[*] Restarting backend service..."
+systemctl restart "$BACKEND_SERVICE"
 
-echo "[*] Starting new screen sessions..."
-screen -dmS "$SCREEN_NAME_BACKEND" "$MEDIA_ROOT/backend" --config "$CONFIG_FILE"
-screen -dmS "$SCREEN_NAME_ROUTINEUPDATE" "$MEDIA_ROOT/routine_update" --config "$CONFIG_FILE"
+echo "[*] Launching routine update unit..."
+systemctl start "$ROUTINE_SERVICE"
 
 echo "[*] Restarting nginx..."
 systemctl restart "$NGINX_SERVICE"
@@ -792,23 +911,50 @@ fn shell_quote(path: &Path) -> String {
 }
 
 fn install_systemd_units(cfg: &InstallConfig) -> Result<()> {
-    let service_path = PathBuf::from("/etc/systemd/system").join(SOFTWARE_SERVICE);
-    let timer_path = PathBuf::from("/etc/systemd/system").join(SOFTWARE_TIMER);
-    if let Some(parent) = service_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let working_dir = escape_systemd_path(&cfg.www_root)?;
+    let systemd_dir = PathBuf::from("/etc/systemd/system");
+    fs::create_dir_all(&systemd_dir)?;
+
+    let updater_service = systemd_dir.join(SOFTWARE_SERVICE);
+    let timer_path = systemd_dir.join(SOFTWARE_TIMER);
+    let backend_service = systemd_dir.join(BACKEND_SERVICE);
+    let routine_service = systemd_dir.join(ROUTINE_SERVICE);
+
+    let www_working_dir = escape_systemd_path(&cfg.www_root)?;
     let helper_exec = escape_systemd_path(&cfg.media_root.join(HELPER_SCRIPT_NAME))?;
-    let service_contents = format!(
-        "[Unit]\nDescription=Update, build (cargo), run software in screen, then restart nginx\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nWorkingDirectory={}\nExecStart={}\nTimeoutStartSec=3600\n\n[Install]\nWantedBy=multi-user.target\n",
-        working_dir, helper_exec
+    let updater_contents = format!(
+        "[Unit]\nDescription=Update, rebuild, and restart ViewTube services\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nWorkingDirectory={}\nExecStart={}\nTimeoutStartSec=3600\n\n[Install]\nWantedBy=multi-user.target\n",
+        www_working_dir, helper_exec
     );
-    fs::write(&service_path, service_contents)?;
-    if let Some(parent) = timer_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    fs::write(&updater_service, updater_contents)?;
+
     let timer_contents = "[Unit]\nDescription=Run software-updater.service daily\n\n[Timer]\nOnCalendar=*-*-* 03:00\nPersistent=true\nUnit=software-updater.service\n\n[Install]\nWantedBy=timers.target\n";
     fs::write(&timer_path, timer_contents)?;
+
+    let media_work_dir = escape_systemd_path(&cfg.media_root)?;
+    let backend_exec = escape_systemd_path(&cfg.media_root.join("backend"))?;
+    let config_path = escape_systemd_path(&cfg.config_path)?;
+    let backend_contents = format!(
+        "[Unit]\nDescription=ViewTube backend API\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser={user}\nGroup={group}\nWorkingDirectory={work}\nExecStart={exec} --config {config}\nRestart=on-failure\nRestartSec=2\nAmbientCapabilities=\nCapabilityBoundingSet=\nNoNewPrivileges=yes\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=yes\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nUMask=0027\nReadWritePaths={work}\n\n[Install]\nWantedBy=multi-user.target\n",
+        user = BACKEND_USER,
+        group = VIEWTUBE_GROUP,
+        work = media_work_dir,
+        exec = backend_exec,
+        config = config_path
+    );
+    fs::write(&backend_service, backend_contents)?;
+
+    let routine_exec = escape_systemd_path(&cfg.media_root.join("routine_update"))?;
+    let www_dir = escape_systemd_path(&cfg.www_root)?;
+    let routine_contents = format!(
+        "[Unit]\nDescription=ViewTube nightly channel refresh\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser={user}\nGroup={group}\nWorkingDirectory={work}\nExecStart={exec} --config {config} --media-root {work} --www-root {www}\nAmbientCapabilities=\nCapabilityBoundingSet=\nNoNewPrivileges=yes\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=yes\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nUMask=0027\nReadWritePaths={work}\n\n[Install]\nWantedBy=multi-user.target\n",
+        user = DOWNLOADER_USER,
+        group = VIEWTUBE_GROUP,
+        work = media_work_dir,
+        exec = routine_exec,
+        config = config_path,
+        www = www_dir
+    );
+    fs::write(&routine_service, routine_contents)?;
     Ok(())
 }
 
@@ -824,6 +970,7 @@ fn run_helper_script(path: &Path) -> Result<()> {
 }
 
 fn show_status() -> Result<()> {
+    let _ = run_command_allow_fail("systemctl", &["status", BACKEND_SERVICE]);
     let _ = run_command_allow_fail("systemctl", &["status", SOFTWARE_TIMER]);
     let _ = run_command_allow_fail("systemctl", &["list-timers"]);
     Ok(())
@@ -974,6 +1121,7 @@ mod tests {
             media_root: PathBuf::from("/yt"),
             www_root: PathBuf::from("/www"),
             newtube_port: 8080,
+            newtube_host: "127.0.0.1".into(),
             config_path: PathBuf::from("/etc/viewtube-env"),
             domain_name: "example.com".into(),
             app_version: "1.0.0".into(),
@@ -981,7 +1129,8 @@ mod tests {
         };
         let contents = helper_script_contents(&cfg);
         assert!(contents.contains("cleanup_repo"));
-        assert!(contents.contains("NEWTUBE_PORT"));
-        assert!(contents.contains("--config \"$CONFIG_FILE\""));
+        assert!(contents.contains("NEWTUBE_HOST"));
+        assert!(contents.contains("--host \"$NEWTUBE_HOST\""));
+        assert!(contents.contains("systemctl restart \"$BACKEND_SERVICE\""));
     }
 }

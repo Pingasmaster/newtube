@@ -8,7 +8,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -29,6 +29,7 @@ use newtube_tools::metadata::{
 };
 #[cfg(test)]
 use newtube_tools::metadata::{MetadataStore, SubtitleTrack};
+use newtube_tools::security::ensure_not_root;
 use parking_lot::RwLock;
 #[cfg(test)]
 use rusqlite::Connection;
@@ -45,10 +46,6 @@ const SHORTS_SUBDIR: &str = "shorts";
 const THUMBNAILS_SUBDIR: &str = "thumbnails";
 const SUBTITLES_SUBDIR: &str = "subtitles";
 
-// Network defaults. Both can be overridden through env vars/env but in most
-// deployments we bind to every interface on the host.
-const DEFAULT_HOST: &str = "0.0.0.0";
-
 // SQLite database file relative to the media root.
 const METADATA_DB_FILE: &str = "metadata.db";
 
@@ -56,6 +53,7 @@ const METADATA_DB_FILE: &str = "metadata.db";
 struct BackendArgs {
     media_root: PathBuf,
     newtube_port: u16,
+    listen_host: IpAddr,
 }
 
 impl BackendArgs {
@@ -69,6 +67,7 @@ impl BackendArgs {
     {
         let mut media_root_override: Option<PathBuf> = None;
         let mut port_override: Option<u16> = None;
+        let mut host_override: Option<IpAddr> = None;
         let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut args = iter.into_iter();
         while let Some(arg) = args.next() {
@@ -78,6 +77,10 @@ impl BackendArgs {
             }
             if let Some(value) = arg.strip_prefix("--port=") {
                 port_override = Some(parse_port_arg(value)?);
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--host=") {
+                host_override = Some(parse_host_arg(value)?);
                 continue;
             }
             if let Some(value) = arg.strip_prefix("--config=") {
@@ -98,6 +101,12 @@ impl BackendArgs {
                         .ok_or_else(|| anyhow!("--port requires a value"))?;
                     port_override = Some(parse_port_arg(&value)?);
                 }
+                "--host" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--host requires a value"))?;
+                    host_override = Some(parse_host_arg(&value)?);
+                }
                 "--config" => {
                     let value = args
                         .next()
@@ -109,12 +118,15 @@ impl BackendArgs {
         }
 
         let runtime_paths = load_runtime_paths_from(&config_path)?;
+        let runtime_host = parse_host_arg(&runtime_paths.newtube_host)?;
         let media_root = media_root_override.unwrap_or(runtime_paths.media_root);
         let newtube_port = port_override.unwrap_or(runtime_paths.newtube_port);
+        let listen_host = host_override.unwrap_or(runtime_host);
 
         Ok(Self {
             media_root,
             newtube_port,
+            listen_host,
         })
     }
 }
@@ -123,6 +135,12 @@ fn parse_port_arg(value: &str) -> Result<u16> {
     value
         .parse::<u16>()
         .context("expected a numeric port between 0 and 65535")
+}
+
+fn parse_host_arg(value: &str) -> Result<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .context("expected a valid IPv4 or IPv6 address for --host/NEWTUBE_HOST")
 }
 
 #[derive(Clone, Copy)]
@@ -270,7 +288,10 @@ async fn main() -> Result<()> {
     let BackendArgs {
         media_root,
         newtube_port,
+        listen_host,
     } = BackendArgs::parse()?;
+
+    ensure_not_root("backend")?;
 
     // Allow overriding the port via environment variable while retaining the
     // easy default for local testing.
@@ -278,6 +299,11 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(newtube_port);
+
+    let host = match std::env::var("NEWTUBE_HOST") {
+        Ok(value) if !value.trim().is_empty() => parse_host_arg(value.trim())?,
+        _ => listen_host,
+    };
 
     let metadata_path = media_root.join(METADATA_DB_FILE);
     let reader = MetadataReader::new(&metadata_path).context("initializing metadata reader")?;
@@ -320,7 +346,7 @@ async fn main() -> Result<()> {
         .route("/api/shorts/{id}/streams/{format}", get(stream_short_file))
         .with_state(state);
 
-    let addr = SocketAddr::new(DEFAULT_HOST.parse()?, port);
+    let addr = SocketAddr::new(host, port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding to {}", addr))?;
@@ -349,12 +375,12 @@ async fn bootstrap(State(state): State<AppState>) -> ApiResult<Json<BootstrapPay
 
 async fn list_videos(State(state): State<AppState>) -> ApiResult<Json<Vec<VideoRecord>>> {
     let videos = state.get_media_list(MediaCategory::Video).await?;
-    Ok(Json(videos))
+    Ok(Json(sanitize_video_records(&videos)))
 }
 
 async fn list_shorts(State(state): State<AppState>) -> ApiResult<Json<Vec<VideoRecord>>> {
     let shorts = state.get_media_list(MediaCategory::Short).await?;
-    Ok(Json(shorts))
+    Ok(Json(sanitize_video_records(&shorts)))
 }
 
 async fn get_video(
@@ -362,7 +388,7 @@ async fn get_video(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Json<VideoRecord>> {
     let record = state.get_media(MediaCategory::Video, &id).await?;
-    Ok(Json(record))
+    Ok(Json(sanitize_video_record(&record)))
 }
 
 async fn get_short(
@@ -370,7 +396,7 @@ async fn get_short(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Json<VideoRecord>> {
     let record = state.get_media(MediaCategory::Short, &id).await?;
-    Ok(Json(record))
+    Ok(Json(sanitize_video_record(&record)))
 }
 
 async fn get_video_comments(
@@ -566,8 +592,8 @@ impl AppState {
             let subtitles = reader.list_subtitles()?;
             let comments = reader.list_all_comments()?;
             Ok(BootstrapPayload {
-                videos,
-                shorts,
+                videos: sanitize_video_records(&videos),
+                shorts: sanitize_video_records(&shorts),
                 subtitles,
                 comments,
             })
@@ -737,10 +763,22 @@ async fn stream_file(path: PathBuf, mime: Option<Mime>) -> ApiResult<Response> {
     Ok(response)
 }
 
+fn sanitize_video_records(records: &[VideoRecord]) -> Vec<VideoRecord> {
+    records.iter().map(sanitize_video_record).collect()
+}
+
+fn sanitize_video_record(record: &VideoRecord) -> VideoRecord {
+    let mut clone = record.clone();
+    for source in &mut clone.sources {
+        source.path = None;
+    }
+    clone
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
+    use axum::{body::to_bytes, extract::State as AxumState};
     use serde_json::Value;
     use std::{io::Write, path::PathBuf, sync::Arc};
     use tempfile::{NamedTempFile, tempdir};
@@ -849,11 +887,11 @@ mod tests {
         }
     }
 
-    fn write_runtime_config(media: &str, www: &str, port: u16) -> NamedTempFile {
+    fn write_runtime_config(media: &str, www: &str, port: u16, host: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"{port}\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
+            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"{port}\"\nNEWTUBE_HOST=\"{host}\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
         )
         .unwrap();
         file
@@ -870,7 +908,7 @@ mod tests {
 
     #[test]
     fn backend_args_default_media_root() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242);
+        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
         let args = parse_backend_args(&config, &[]);
         assert_eq!(args.media_root, PathBuf::from("/yt/test"));
         assert_eq!(args.newtube_port, 4242);
@@ -878,16 +916,23 @@ mod tests {
 
     #[test]
     fn backend_args_override_media_root() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242);
+        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
         let args = parse_backend_args(&config, &["--media-root", "/custom/media"]);
         assert_eq!(args.media_root, PathBuf::from("/custom/media"));
     }
 
     #[test]
     fn backend_args_override_port() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242);
+        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
         let args = parse_backend_args(&config, &["--port", "9000"]);
         assert_eq!(args.newtube_port, 9000);
+    }
+
+    #[test]
+    fn backend_args_override_host() {
+        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
+        let args = parse_backend_args(&config, &["--host", "0.0.0.0"]);
+        assert_eq!(args.listen_host, "0.0.0.0".parse::<IpAddr>().unwrap());
     }
 
     #[tokio::test]
@@ -933,6 +978,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_responses_strip_file_paths() {
+        let ctx = BackendTestContext::new();
+        let mut video = sample_video("alpha");
+        video.sources[0].path = Some("/yt/videos/alpha/secret.mp4".into());
+        ctx.store.upsert_video(&video).unwrap();
+
+        let Json(videos) = super::list_videos(AxumState(ctx.state.clone()))
+            .await
+            .unwrap();
+        assert!(videos[0].sources[0].path.is_none());
+
+        let Json(single) = super::get_video(AxumState(ctx.state.clone()), AxumPath("alpha".into()))
+            .await
+            .unwrap();
+        assert!(single.sources[0].path.is_none());
+
+        let bootstrap = ctx.state.get_bootstrap().await.unwrap();
+        assert!(bootstrap.videos[0].sources[0].path.is_none());
     }
 
     #[tokio::test]

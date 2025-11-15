@@ -6,6 +6,7 @@ use std::{
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/viewtube-env";
 pub const DEFAULT_NEWTUBE_PORT: u16 = 8080;
+pub const DEFAULT_NEWTUBE_HOST: &str = "127.0.0.1";
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvConfig {
@@ -14,6 +15,7 @@ pub struct EnvConfig {
     pub app_version: Option<String>,
     pub domain_name: Option<String>,
     pub newtube_port: Option<u16>,
+    pub newtube_host: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +23,7 @@ pub struct RuntimePaths {
     pub media_root: PathBuf,
     pub www_root: PathBuf,
     pub newtube_port: u16,
+    pub newtube_host: String,
 }
 
 pub fn read_env_config(path: &Path) -> Result<Option<EnvConfig>> {
@@ -48,6 +51,11 @@ pub fn read_env_config(path: &Path) -> Result<Option<EnvConfig>> {
                         .with_context(|| format!("Parsing NEWTUBE_PORT from {}", path.display()))?;
                     cfg.newtube_port = Some(port);
                 }
+                "NEWTUBE_HOST" => {
+                    if !value.is_empty() {
+                        cfg.newtube_host = Some(value.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -70,10 +78,15 @@ pub fn load_runtime_paths_from(path: impl AsRef<Path>) -> Result<RuntimePaths> {
         .www_root
         .ok_or_else(|| anyhow!("WWW_ROOT not set in {}", path.display()))?;
     let newtube_port = cfg.newtube_port.unwrap_or(DEFAULT_NEWTUBE_PORT);
+    let newtube_host = cfg
+        .newtube_host
+        .clone()
+        .unwrap_or_else(|| DEFAULT_NEWTUBE_HOST.to_string());
     Ok(RuntimePaths {
         media_root,
         www_root,
         newtube_port,
+        newtube_host,
     })
 }
 
@@ -103,5 +116,13 @@ mod tests {
         assert_eq!(runtime.newtube_port, DEFAULT_NEWTUBE_PORT);
         assert_eq!(runtime.media_root, PathBuf::from("/m"));
         assert_eq!(runtime.www_root, PathBuf::from("/w"));
+        assert_eq!(runtime.newtube_host, DEFAULT_NEWTUBE_HOST);
+    }
+
+    #[test]
+    fn load_runtime_paths_reads_host() {
+        let cfg = make_config("MEDIA_ROOT=\"/m\"\nWWW_ROOT=\"/w\"\nNEWTUBE_HOST=\"0.0.0.0\"\n");
+        let runtime = load_runtime_paths_from(cfg.path()).unwrap();
+        assert_eq!(runtime.newtube_host, "0.0.0.0");
     }
 }

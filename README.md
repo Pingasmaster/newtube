@@ -79,7 +79,7 @@ server {
 
 Start the API server:
 
-The runtime knobs are the port of the api and the directories www root and media root which can be customized upon first `./installer` run or in `/etc/viewtubeconfig`
+The runtime knobs are the API port plus the www/media roots. `./installer` writes them into `/etc/viewtube-env`, and every binary described below reads that file automatically (you can still override the values per command).
 
 ```
 screen -S "backend" ./backend
@@ -87,9 +87,35 @@ screen -S "backend" ./backend
 
 CTRL+A and CTRL+D to exit.
 
-The software is not meant to be run manually like this though. A simple execution of ./setup-script.sh will get you up and running.
+Manual `screen` sessions are helpful for debugging, but production installs should use `./installer` instead. It builds the helper script `viewtube-update-build-run.sh` under your media root and registers the `software-updater.timer` systemd unit so the helper runs every night at 03:00, rebuilding binaries, restarting the backend/routine updater, and refreshing nginx automatically.
 
-## Bakend implementation details
+## Program reference
+
+Every Rust binary lives under `target/release/`. Unless you pass overrides, they all read `/etc/viewtube-env` (written by the installer) to discover `MEDIA_ROOT`, `WWW_ROOT`, and `NEWTUBE_PORT`.
+
+### `installer`
+
+- Purpose: one-stop setup/teardown tool. It bootstraps nginx + screen, writes `/etc/viewtube-env`, copies the helper script `viewtube-update-build-run.sh` under the media root, and installs `software-updater.service`/`.timer` so the helper runs nightly. Root privileges are required for install/uninstall/reinstall operations (only `--cleanup` can run as a regular user).
+- Behaviour:
+  - Creates the media root (stores downloads + binaries) and www root (served by nginx), then rebuilds the project and copies `backend`, `download_channel`, and `routine_update` into the media root.
+  - Deploys Let's Encrypt-friendly nginx config based on the provided domain, restarts nginx, and ensures `screen`/`nginx` packages exist.
+  - Registers a systemd timer that executes the helper at 03:00 to `git pull`, rebuild with `cargo build --release`, copy binaries, restart the screen sessions (`backend` + `routine_update`), and reload nginx.
+  - Stores `MEDIA_ROOT`, `WWW_ROOT`, `NEWTUBE_PORT`, `DOMAIN_NAME`, and `APP_VERSION` inside the config file so subsequent runs pick up the same defaults.
+- Flags (managed via Clap):
+  - `-c`, `--cleanup`: delete `node_modules`, `coverage`, stray binaries, and run `cargo clean` in the repo (no root required).
+  - `-u`, `--uninstall`: remove helper/systemd units + config; combine with `--reinstall` to force a fresh install.
+  - `-r`, `--reinstall`: run uninstall first, then install again using the same prompts/overrides.
+  - `--media-dir <path>` and `--www-dir <path>`: override the default `/yt` and `/www/newtube.com` directories instead of accepting the prompts or remembered paths.
+  - `--port <PORT>`: set the backend port stored as `NEWTUBE_PORT` (default 8080).
+  - `--domain <NAME>`: required for new installs; the installer normalizes it (strips scheme/trailing slash) before putting it in nginx config and `/etc/viewtube-env`.
+  - `--config <path>`: choose another env file instead of `/etc/viewtube-env` (useful for non-root dry runs or staging environments).
+  - `-y`, `--assume-yes`: auto-accept any prompt (if you use this for a new install you must also provide `--domain`/path overrides because there is no chance to type them interactively).
+- Usage example:
+  ```bash
+  sudo ./target/release/installer --domain example.com
+  # Later, to wipe scheduled jobs:
+  sudo ./target/release/installer --uninstall
+  ```
 
 ### `backend`
 
@@ -97,11 +123,13 @@ The software is not meant to be run manually like this though. A simple executio
 - Inputs: reads metadata from `/yt/metadata.db` and streams files out of `/yt` (videos, shorts, subtitles, thumbnails).
 - Caching: keeps a read-through cache in memory so hot feeds do not hammer SQLite; restart the process to clear the cache.
 - Flags:
-  - `--media-root <path>` overrides the default `/yt` library root (the metadata database is read from `<path>/metadata.db`).
+  - `--config <path>`: read runtime values from another env file instead of `/etc/viewtube-env`.
+  - `--media-root <path>`: override `MEDIA_ROOT` for metadata/filesystem lookups.
+  - `--port <port>`: override `NEWTUBE_PORT` (defaults to 8080) if you need to bind the Axum server somewhere else.
 - Usage example:
   ```bash
-  ./backend
-  # -> API server listening on http://0.0.0.0:8080
+  ./backend --config /etc/viewtube-env --port 9090
+  # -> API server listening on http://0.0.0.0:9090
   ```
 
 ### `download_channel`
@@ -114,11 +142,12 @@ The software is not meant to be run manually like this though. A simple executio
   - Writes/updates `/yt/download-archive.txt` so future runs skip duplicates.
   - Inserts/updates rows inside `/yt/metadata.db` so the backend sees the new content immediately.
 - Flags:
+  - `--config <path>`: load `MEDIA_ROOT`/`WWW_ROOT` defaults from a specific env file rather than `/etc/viewtube-env`.
   - `--media-root <path>` stores media + metadata under a custom directory instead of `/yt`.
   - `--www-root <path>` controls where the static frontend directory is created (defaults to `/www/newtube.com`).
 - Usage example:
   ```bash
-  ./download_channel https://www.youtube.com/@LinusTechTips
+  ./download_channel --media-root /data/yt --www-root /srv/www https://www.youtube.com/@LinusTechTips
   ```
   The program prints progress for each video, clearly separating long-form uploads and Shorts.
 
@@ -130,15 +159,16 @@ The software is not meant to be run manually like this though. A simple executio
   - Extracts the original `channel_url`/`uploader_url` from those JSON blobs and deduplicates them.
   - Sequentially invokes `download_channel <channel_url>` so each channel gets refreshed with the latest uploads/comments.
 - Flags:
+  - `--config <path>`: use a different env file for defaults and to forward into the downloader.
   - `--media-root <path>` matches the library root passed to `download_channel`/`backend` (default `/yt`).
-  - `--www-root <path>` mirrors the downloader flag for consistency, letting you document the static site root if it lives somewhere else.
+  - `--www-root <path>` mirrors the downloader flag; forwarded to each `download_channel` call so the helper can rebuild the same site directory.
 - Usage example:
   ```bash
-  ./routine_update
+  ./routine_update --config /etc/viewtube-env
   ```
   Combine it with a scheduler (cron/systemd timers) to keep your library synced overnight without manual intervention.
 
-All three utilities share the same Rust crate (`newtube_tools`), so adding new metadata fields only requires updating the structs once.
+All four binaries share the same Rust crate (`newtube_tools`), so adding new metadata fields or config knobs only requires updating the shared structs once.
 
 # Tests
 

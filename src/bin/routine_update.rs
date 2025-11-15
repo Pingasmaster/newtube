@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use newtube_tools::{
     config::{DEFAULT_CONFIG_PATH, load_runtime_paths_from},
     metadata::MetadataStore,
+    security::ensure_not_root,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -110,6 +111,8 @@ struct MinimalInfo {
 /// Scans on-disk metadata, identifies unique channels, and launches
 /// `download_channel` for each.
 fn main() -> Result<()> {
+    ensure_not_root("routine_update")?;
+
     let RoutineArgs {
         media_root,
         www_root,
@@ -305,7 +308,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
+            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nNEWTUBE_HOST=\"127.0.0.1\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
         )
         .unwrap();
         file

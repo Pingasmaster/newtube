@@ -13,6 +13,7 @@ use newtube_tools::config::{DEFAULT_CONFIG_PATH, load_runtime_paths_from};
 use newtube_tools::metadata::{
     CommentRecord, MetadataStore, SubtitleCollection, SubtitleTrack, VideoRecord, VideoSource,
 };
+use newtube_tools::security::ensure_not_root;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -309,6 +310,8 @@ enum MediaKind {
 /// CLI entry point. Validates prerequisites, prepares directories, and kicks
 /// off downloads for both standard uploads and Shorts.
 fn main() -> Result<()> {
+    ensure_not_root("download_channel")?;
+
     let DownloaderArgs {
         channel_url,
         media_root,
@@ -1419,7 +1422,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
+            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nNEWTUBE_HOST=\"127.0.0.1\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
         )
         .unwrap();
         file

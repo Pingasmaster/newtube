@@ -5,25 +5,225 @@ log() {
     printf '[setup] %s\n' "$*"
 }
 
+prompt_yes_no() {
+    local prompt=$1
+    local response
+    while true; do
+        if ! read -rp "$prompt [y/N]: " response; then
+            echo "\nInput aborted." >&2
+            exit 1
+        fi
+        response=${response,,}
+        case "$response" in
+            y|yes) return 0 ;;
+            n|no|"") return 1 ;;
+            *) echo "Please answer y or n." ;;
+        esac
+    done
+}
+
+prompt_for_domain() {
+    local current_value=${DOMAIN_NAME:-}
+    if [[ -n "$current_value" ]]; then
+        if prompt_yes_no "Detected existing domain '$current_value'. Keep this value?"; then
+            DOMAIN_NAME="$current_value"
+            return
+        fi
+    fi
+
+    while true; do
+        local domain_input
+        if ! read -rp "Enter the domain name serving Viewtube (e.g. example.com): " domain_input; then
+            echo "\nInput aborted." >&2
+            exit 1
+        fi
+        domain_input=$(printf '%s' "$domain_input" | xargs)
+        domain_input=${domain_input#https://}
+        domain_input=${domain_input#http://}
+        domain_input=${domain_input#/}
+        domain_input=${domain_input%/}
+        domain_input=${domain_input,,}
+        if [[ "$domain_input" =~ [[:space:]] ]]; then
+            echo "Domain name cannot contain whitespace." >&2
+            continue
+        fi
+        if [[ "$domain_input" == */* ]]; then
+            echo "Domain name cannot contain path segments." >&2
+            continue
+        fi
+        if [[ -n "$domain_input" ]]; then
+            DOMAIN_NAME="$domain_input"
+            break
+        fi
+        echo "Domain name cannot be empty." >&2
+    done
+}
+
+detect_package_manager() {
+    local managers=(apt-get apt dnf yum pacman apk zypper)
+    local mgr
+    for mgr in "${managers[@]}"; do
+        if command -v "$mgr" >/dev/null 2>&1; then
+            echo "$mgr"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_nginx_package() {
+    local manager
+    if ! manager=$(detect_package_manager); then
+        echo "Could not detect a supported package manager. Please install nginx manually and rerun." >&2
+        exit 1
+    fi
+
+    log "Installing nginx via $manager"
+    case "$manager" in
+        apt-get)
+            apt-get update
+            apt-get install -y nginx
+            ;;
+        apt)
+            apt update
+            apt install -y nginx
+            ;;
+        dnf)
+            dnf install -y nginx
+            ;;
+        yum)
+            yum install -y nginx
+            ;;
+        pacman)
+            pacman -Sy --noconfirm nginx
+            ;;
+        apk)
+            apk update
+            apk add nginx
+            ;;
+        zypper)
+            zypper refresh
+            zypper install -y nginx
+            ;;
+        *)
+            echo "Package manager $manager is not supported by this installer." >&2
+            exit 1
+            ;;
+    esac
+
+    systemctl enable --now "$NGINX_SERVICE"
+}
+
+ensure_nginx_installed() {
+    if systemctl list-unit-files --type=service --all | grep -q "^${NGINX_SERVICE}\.service"; then
+        log "Detected ${NGINX_SERVICE}.service"
+        return
+    fi
+
+    log "${NGINX_SERVICE}.service not detected."
+    if prompt_yes_no "Install nginx now"; then
+        install_nginx_package
+    else
+        echo "nginx is required for this setup. Aborting." >&2
+        exit 1
+    fi
+}
+
+deploy_nginx_config() {
+    local config_path symlink_path
+    if [[ -d /etc/nginx/sites-available ]]; then
+        config_path="/etc/nginx/sites-available/viewtube.conf"
+        symlink_path="/etc/nginx/sites-enabled/viewtube.conf"
+    else
+        config_path="/etc/nginx/conf.d/viewtube.conf"
+        symlink_path=""
+    fi
+
+    local action="create"
+    if [[ -f "$config_path" ]]; then
+        action="replace"
+    fi
+
+    if ! prompt_yes_no "Deploy the recommended nginx config to $config_path (will $action existing content)"; then
+        log "Skipping nginx config deployment"
+        return
+    fi
+
+    install -d "$(dirname "$config_path")"
+    cat <<EOF > "$config_path"
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN_NAME;
+
+    return 301 https://$DOMAIN_NAME\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN_NAME;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem;
+    ssl_prefer_server_ciphers on;
+
+    root $WWW_ROOT;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF
+
+    if [[ -n "$symlink_path" ]]; then
+        install -d "$(dirname "$symlink_path")"
+        ln -sf "$config_path" "$symlink_path"
+    fi
+
+    if command -v nginx >/dev/null 2>&1; then
+        nginx -t
+        systemctl reload "$NGINX_SERVICE"
+    fi
+
+    log "Deployed nginx config to $config_path"
+}
+
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root." >&2
     exit 1
 fi
 
 CONFIG_FILE="/etc/viewtube-env"
+NGINX_SERVICE="nginx"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1091
+    . "$CONFIG_FILE"
+fi
+
 MEDIA_ROOT="${MEDIA_ROOT:-/yt}"
 WWW_ROOT="${WWW_ROOT:-/www/newtube.com}"
 APP_VERSION="${APP_VERSION:-0.1.0}"
+DOMAIN_NAME="${DOMAIN_NAME:-}"
 HELPER_SCRIPT="$MEDIA_ROOT/viewtube-update-build-run.sh"
+
+prompt_for_domain
+log "Using domain: $DOMAIN_NAME"
 
 log "Creating MEDIA_ROOT ($MEDIA_ROOT) and WWW_ROOT ($WWW_ROOT)"
 mkdir -p "$MEDIA_ROOT" "$WWW_ROOT"
+
+ensure_nginx_installed
+deploy_nginx_config
 
 log "Writing config to $CONFIG_FILE"
 cat <<EOF > "$CONFIG_FILE"
 MEDIA_ROOT="$MEDIA_ROOT"
 WWW_ROOT="$WWW_ROOT"
 APP_VERSION="$APP_VERSION"
+DOMAIN_NAME="$DOMAIN_NAME"
 EOF
 
 log "Writing helper script to $HELPER_SCRIPT"
@@ -70,6 +270,7 @@ if [[ "$APP_VERSION" != "$CARGO_VERSION" ]]; then
 MEDIA_ROOT="$MEDIA_ROOT"
 WWW_ROOT="$WWW_ROOT"
 APP_VERSION="$CARGO_VERSION"
+DOMAIN_NAME="$DOMAIN_NAME"
 EOF
     SETUP_SCRIPT_PATH="$APP_DIR/setup-software.sh"
     if [[ -x "$SETUP_SCRIPT_PATH" ]]; then

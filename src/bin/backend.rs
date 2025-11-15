@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     body::Body,
@@ -37,9 +37,9 @@ use serde_json::json;
 use tokio::{fs::File, signal, task};
 use tokio_util::io::ReaderStream;
 
-// Directory layout constants. Keeping them centralized means the same values
+// Directory layout defaults. Keeping them centralized means the same values
 // can be used when serving both long-form and short-form videos.
-const BASE_DIR: &str = "/yt";
+const DEFAULT_MEDIA_ROOT: &str = "/yt";
 const VIDEOS_SUBDIR: &str = "videos";
 const SHORTS_SUBDIR: &str = "shorts";
 const THUMBNAILS_SUBDIR: &str = "thumbnails";
@@ -50,8 +50,50 @@ const SUBTITLES_SUBDIR: &str = "subtitles";
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 8080;
 
-// SQLite database location that the downloader keeps up to date.
-const METADATA_DB_PATH: &str = "/yt/metadata.db";
+// SQLite database file relative to the media root.
+const METADATA_DB_FILE: &str = "metadata.db";
+
+#[derive(Debug, Clone)]
+struct BackendArgs {
+    media_root: PathBuf,
+}
+
+impl BackendArgs {
+    fn parse() -> Result<Self> {
+        Self::from_iter(std::env::args().skip(1))
+    }
+
+    #[cfg(test)]
+    fn from_slice(values: &[&str]) -> Result<Self> {
+        Self::from_iter(values.iter().map(|value| value.to_string()))
+    }
+
+    fn from_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut media_root = PathBuf::from(DEFAULT_MEDIA_ROOT);
+        let mut args = iter.into_iter();
+        while let Some(arg) = args.next() {
+            if let Some(value) = arg.strip_prefix("--media-root=") {
+                media_root = PathBuf::from(value);
+                continue;
+            }
+
+            match arg.as_str() {
+                "--media-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--media-root requires a value"))?;
+                    media_root = PathBuf::from(value);
+                }
+                _ => return Err(anyhow!("unknown argument: {arg}")),
+            }
+        }
+
+        Ok(Self { media_root })
+    }
+}
 
 #[derive(Clone, Copy)]
 enum MediaCategory {
@@ -125,14 +167,13 @@ struct FilePaths {
 }
 
 impl FilePaths {
-    /// Builds the folder structure from the constants at the top of the file.
-    fn new() -> Self {
-        let base = PathBuf::from(BASE_DIR);
+    /// Builds the folder structure based on the provided media root.
+    fn new(media_root: &Path) -> Self {
         Self {
-            videos: base.join(VIDEOS_SUBDIR),
-            shorts: base.join(SHORTS_SUBDIR),
-            thumbnails: base.join(THUMBNAILS_SUBDIR),
-            subtitles: base.join(SUBTITLES_SUBDIR),
+            videos: media_root.join(VIDEOS_SUBDIR),
+            shorts: media_root.join(SHORTS_SUBDIR),
+            thumbnails: media_root.join(THUMBNAILS_SUBDIR),
+            subtitles: media_root.join(SUBTITLES_SUBDIR),
         }
     }
 
@@ -148,12 +189,7 @@ impl FilePaths {
 #[cfg(test)]
 impl FilePaths {
     fn for_base(path: &Path) -> Self {
-        let paths = Self {
-            videos: path.join(VIDEOS_SUBDIR),
-            shorts: path.join(SHORTS_SUBDIR),
-            thumbnails: path.join(THUMBNAILS_SUBDIR),
-            subtitles: path.join(SUBTITLES_SUBDIR),
-        };
+        let paths = Self::new(path);
         std::fs::create_dir_all(&paths.videos).unwrap();
         std::fs::create_dir_all(&paths.shorts).unwrap();
         std::fs::create_dir_all(&paths.thumbnails).unwrap();
@@ -201,6 +237,8 @@ type ApiResult<T> = Result<T, ApiError>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let BackendArgs { media_root } = BackendArgs::parse()?;
+
     // Allow overriding the port via environment variable while retaining the
     // easy default for local testing.
     let port = std::env::var("NEWTUBE_PORT")
@@ -208,12 +246,14 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let reader = MetadataReader::new(METADATA_DB_PATH).context("initializing metadata reader")?;
+    let metadata_path = media_root.join(METADATA_DB_FILE);
+    let reader =
+        MetadataReader::new(&metadata_path).context("initializing metadata reader")?;
 
     let state = AppState {
         reader: Arc::new(reader),
         cache: Arc::new(ApiCache::new()),
-        files: Arc::new(FilePaths::new()),
+        files: Arc::new(FilePaths::new(&media_root)),
     };
 
     // Each route is extremely small; helpers supplement anything that is shared
@@ -663,7 +703,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
     use tempfile::tempdir;
 
     struct BackendTestContext {
@@ -768,6 +808,18 @@ mod tests {
             status_likedbycreator: false,
             reply_count: Some(0),
         }
+    }
+
+    #[test]
+    fn backend_args_default_media_root() {
+        let args = BackendArgs::from_slice(&[]).expect("parsed args");
+        assert_eq!(args.media_root, PathBuf::from(DEFAULT_MEDIA_ROOT));
+    }
+
+    #[test]
+    fn backend_args_override_media_root() {
+        let args = BackendArgs::from_slice(&["--media-root", "/custom/media"]).unwrap();
+        assert_eq!(args.media_root, PathBuf::from("/custom/media"));
     }
 
     #[tokio::test]

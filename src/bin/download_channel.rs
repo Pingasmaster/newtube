@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
-const BASE_DIR: &str = "/yt";
+const DEFAULT_MEDIA_ROOT: &str = "/yt";
 const VIDEOS_SUBDIR: &str = "videos";
 const SHORTS_SUBDIR: &str = "shorts";
 const SUBTITLES_SUBDIR: &str = "subtitles";
@@ -31,7 +31,7 @@ const THUMBNAILS_SUBDIR: &str = "thumbnails";
 const COMMENTS_SUBDIR: &str = "comments";
 const ARCHIVE_FILE: &str = "download-archive.txt";
 const COOKIES_FILE: &str = "cookies.txt";
-const WWW_ROOT: &str = "/www/newtube.com";
+const DEFAULT_WWW_ROOT: &str = "/www/newtube.com";
 const METADATA_DB_FILE: &str = "metadata.db";
 
 #[cfg(test)]
@@ -84,6 +84,93 @@ struct Paths {
     cookies: PathBuf,
     www_root: PathBuf,
     metadata_db: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DownloaderArgs {
+    channel_url: String,
+    media_root: PathBuf,
+    www_root: PathBuf,
+}
+
+impl DownloaderArgs {
+    fn parse() -> Result<Self> {
+        Self::from_iter(env::args().skip(1))
+    }
+
+    #[cfg(test)]
+    fn from_slice(values: &[&str]) -> Result<Self> {
+        Self::from_iter(values.iter().map(|value| value.to_string()))
+    }
+
+    fn from_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut media_root = PathBuf::from(DEFAULT_MEDIA_ROOT);
+        let mut www_root = PathBuf::from(DEFAULT_WWW_ROOT);
+        let mut channel_url: Option<String> = None;
+        let mut args = iter.into_iter();
+
+        while let Some(arg) = args.next() {
+            if arg == "--" {
+                for value in args {
+                    Self::set_channel(&mut channel_url, value)?;
+                }
+                break;
+            }
+
+            if let Some(value) = arg.strip_prefix("--media-root=") {
+                media_root = PathBuf::from(value);
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--www-root=") {
+                www_root = PathBuf::from(value);
+                continue;
+            }
+
+            match arg.as_str() {
+                "--media-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--media-root requires a value"))?;
+                    media_root = PathBuf::from(value);
+                }
+                "--www-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--www-root requires a value"))?;
+                    www_root = PathBuf::from(value);
+                }
+                _ if arg.starts_with('-') => {
+                    bail!("unknown argument: {arg}");
+                }
+                _ => {
+                    Self::set_channel(&mut channel_url, arg)?;
+                }
+            }
+        }
+
+        let channel_url = channel_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Usage: download_channel [--media-root <path>] [--www-root <path>] <channel_url>"
+            )
+        })?;
+
+        Ok(Self {
+            channel_url,
+            media_root,
+            www_root,
+        })
+    }
+
+    fn set_channel(target: &mut Option<String>, value: String) -> Result<()> {
+        if target.is_some() {
+            bail!("channel URL specified multiple times");
+        }
+        *target = Some(value);
+        Ok(())
+    }
 }
 
 /// Minimal version of yt-dlp's `info.json` just to extract available formats.
@@ -204,19 +291,15 @@ enum MediaKind {
 /// CLI entry point. Validates prerequisites, prepares directories, and kicks
 /// off downloads for both standard uploads and Shorts.
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
-    let channel_url = match args.next() {
-        Some(url) => url,
-        None => {
-            eprintln!("Usage: download_channel <channel_url>");
-            eprintln!("Example: download_channel https://www.youtube.com/@channelname");
-            std::process::exit(1);
-        }
-    };
+    let DownloaderArgs {
+        channel_url,
+        media_root,
+        www_root,
+    } = DownloaderArgs::parse()?;
 
     ensure_program_available("yt-dlp")?;
 
-    let paths = Paths::new();
+    let paths = Paths::with_roots(&media_root, &www_root);
     paths.prepare()?;
     let mut metadata =
         MetadataStore::open(&paths.metadata_db).context("initializing metadata database")?;
@@ -226,6 +309,7 @@ fn main() -> Result<()> {
     println!("===================================");
     println!("Channel: {}", channel_url);
     println!("Base directory: {}", paths.base.display());
+    println!("WWW root: {}", paths.www_root.display());
     println!();
 
     println!("Starting download process...");
@@ -277,9 +361,9 @@ fn main() -> Result<()> {
 }
 
 impl Paths {
-    /// Builds the struct using the global constants defined at the top.
-    fn new() -> Self {
-        let base = PathBuf::from(BASE_DIR);
+    /// Builds the struct using the provided media and www roots.
+    fn with_roots(media_root: &Path, www_root: &Path) -> Self {
+        let base = media_root.to_path_buf();
         let videos = base.join(VIDEOS_SUBDIR);
         let shorts = base.join(SHORTS_SUBDIR);
         let subtitles = base.join(SUBTITLES_SUBDIR);
@@ -287,8 +371,8 @@ impl Paths {
         let comments = base.join(COMMENTS_SUBDIR);
         let archive = base.join(ARCHIVE_FILE);
         let cookies = base.join(COOKIES_FILE);
-        let www_root = PathBuf::from(WWW_ROOT);
-        let metadata_db = www_root.join(METADATA_DB_FILE);
+        let www_root = www_root.to_path_buf();
+        let metadata_db = base.join(METADATA_DB_FILE);
 
         Self {
             base,
@@ -334,29 +418,8 @@ impl Paths {
 #[cfg(test)]
 impl Paths {
     fn from_base(base: &Path) -> Self {
-        let base = base.to_path_buf();
-        let videos = base.join(VIDEOS_SUBDIR);
-        let shorts = base.join(SHORTS_SUBDIR);
-        let subtitles = base.join(SUBTITLES_SUBDIR);
-        let thumbnails = base.join(THUMBNAILS_SUBDIR);
-        let comments = base.join(COMMENTS_SUBDIR);
-        let archive = base.join(ARCHIVE_FILE);
-        let cookies = base.join(COOKIES_FILE);
         let www_root = base.join("www");
-        let metadata_db = www_root.join(METADATA_DB_FILE);
-
-        Self {
-            base,
-            videos,
-            shorts,
-            subtitles,
-            thumbnails,
-            comments,
-            archive,
-            cookies,
-            www_root,
-            metadata_db,
-        }
+        Self::with_roots(base, &www_root)
     }
 }
 
@@ -1329,7 +1392,7 @@ mod tests {
     use anyhow::Result;
     use newtube_tools::metadata::MetadataReader;
     use std::collections::{HashMap, HashSet};
-    use std::fs;
+    use std::{fs, path::PathBuf};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -1338,6 +1401,30 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = Paths::from_base(dir.path());
         (dir, paths)
+    }
+
+    #[test]
+    fn downloader_args_use_defaults() {
+        let args =
+            DownloaderArgs::from_slice(&["https://www.youtube.com/@Channel"]).unwrap();
+        assert_eq!(args.channel_url, "https://www.youtube.com/@Channel");
+        assert_eq!(args.media_root, PathBuf::from(DEFAULT_MEDIA_ROOT));
+        assert_eq!(args.www_root, PathBuf::from(DEFAULT_WWW_ROOT));
+    }
+
+    #[test]
+    fn downloader_args_override_roots() {
+        let args = DownloaderArgs::from_slice(&[
+            "--media-root",
+            "/data/media",
+            "--www-root",
+            "/srv/www",
+            "https://www.youtube.com/@Channel",
+        ])
+        .unwrap();
+
+        assert_eq!(args.media_root, PathBuf::from("/data/media"));
+        assert_eq!(args.www_root, PathBuf::from("/srv/www"));
     }
 
     fn sample_video_info() -> VideoInfo {

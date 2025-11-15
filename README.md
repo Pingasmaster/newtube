@@ -39,6 +39,8 @@ CTRL+A and CTRL+D to exit.
 - Purpose: lightweight Axum HTTP server that exposes `/api/*` routes consumed by the web UI.
 - Inputs: reads metadata from `/yt/metadata.db` and streams files out of `/yt` (videos, shorts, subtitles, thumbnails).
 - Caching: keeps a read-through cache in memory so hot feeds do not hammer SQLite; restart the process to clear the cache.
+- Flags:
+  - `--media-root <path>` overrides the default `/yt` library root (the metadata database is read from `<path>/metadata.db`).
 - Usage example:
   ```bash
   NEWTUBE_PORT=9000 ./backend
@@ -54,6 +56,9 @@ CTRL+A and CTRL+D to exit.
   - Downloads *all* muxed video formats, subtitles (auto + manual), thumbnails, `.info.json`, `.description`, and the latest ~500 comments per video.
   - Writes/updates `/yt/download-archive.txt` so future runs skip duplicates.
   - Inserts/updates rows inside `/yt/metadata.db` so the backend sees the new content immediately.
+- Flags:
+  - `--media-root <path>` stores media + metadata under a custom directory instead of `/yt`.
+  - `--www-root <path>` controls where the static frontend directory is created (defaults to `/www/newtube.com`).
 - Usage example:
   ```bash
   ./download_channel https://www.youtube.com/@LinusTechTips
@@ -67,6 +72,9 @@ CTRL+A and CTRL+D to exit.
   - Walks `/yt/videos/**` and `/yt/shorts/**` looking for `<video_id>.info.json` files.
   - Extracts the original `channel_url`/`uploader_url` from those JSON blobs and deduplicates them.
   - Sequentially invokes `download_channel <channel_url>` so each channel gets refreshed with the latest uploads/comments.
+- Flags:
+  - `--media-root <path>` matches the library root passed to `download_channel`/`backend` (default `/yt`).
+  - `--www-root <path>` mirrors the downloader flag for consistency, letting you document the static site root if it lives somewhere else.
 - Usage example:
   ```bash
   ./routine_update

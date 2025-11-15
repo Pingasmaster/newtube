@@ -16,11 +16,71 @@ use std::process::Command;
 use std::sync::Mutex;
 use walkdir::WalkDir;
 
-const BASE_DIR: &str = "/yt";
+const DEFAULT_MEDIA_ROOT: &str = "/yt";
 const VIDEOS_SUBDIR: &str = "videos";
 const SHORTS_SUBDIR: &str = "shorts";
-const WWW_ROOT: &str = "/www/newtube.com";
+const DEFAULT_WWW_ROOT: &str = "/www/newtube.com";
 const METADATA_DB_FILE: &str = "metadata.db";
+
+#[derive(Debug, Clone)]
+struct RoutineArgs {
+    media_root: PathBuf,
+    www_root: PathBuf,
+}
+
+impl RoutineArgs {
+    fn parse() -> Result<Self> {
+        Self::from_iter(env::args().skip(1))
+    }
+
+    #[cfg(test)]
+    fn from_slice(values: &[&str]) -> Result<Self> {
+        Self::from_iter(values.iter().map(|value| value.to_string()))
+    }
+
+    fn from_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut media_root = PathBuf::from(DEFAULT_MEDIA_ROOT);
+        let mut www_root = PathBuf::from(DEFAULT_WWW_ROOT);
+        let mut args = iter.into_iter();
+
+        while let Some(arg) = args.next() {
+            if let Some(value) = arg.strip_prefix("--media-root=") {
+                media_root = PathBuf::from(value);
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--www-root=") {
+                www_root = PathBuf::from(value);
+                continue;
+            }
+
+            match arg.as_str() {
+                "--media-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--media-root requires a value"))?;
+                    media_root = PathBuf::from(value);
+                }
+                "--www-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--www-root requires a value"))?;
+                    www_root = PathBuf::from(value);
+                }
+                _ => {
+                    bail!("unknown argument: {arg}");
+                }
+            }
+        }
+
+        Ok(Self {
+            media_root,
+            www_root,
+        })
+    }
+}
 
 /// Only grab the small subset of fields we need from `.info.json`.
 #[derive(Deserialize)]
@@ -32,11 +92,19 @@ struct MinimalInfo {
 /// Scans on-disk metadata, identifies unique channels, and launches
 /// `download_channel` for each.
 fn main() -> Result<()> {
-    let metadata_path = Path::new(WWW_ROOT).join(METADATA_DB_FILE);
+    let RoutineArgs {
+        media_root,
+        www_root,
+    } = RoutineArgs::parse()?;
+
+    let metadata_path = media_root.join(METADATA_DB_FILE);
     let _metadata =
         MetadataStore::open(&metadata_path).context("initializing metadata database")?;
 
-    let base_dir = PathBuf::from(BASE_DIR);
+    println!("Library root: {}", media_root.display());
+    println!("WWW root: {}", www_root.display());
+
+    let base_dir = media_root;
     let videos_dir = base_dir.join(VIDEOS_SUBDIR);
     let shorts_dir = base_dir.join(SHORTS_SUBDIR);
 
@@ -198,9 +266,30 @@ fn find_download_channel_executable() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::{fs::{self, File}, path::PathBuf};
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn routine_args_default_paths() {
+        let args = RoutineArgs::from_slice(&[]).unwrap();
+        assert_eq!(args.media_root, PathBuf::from(DEFAULT_MEDIA_ROOT));
+        assert_eq!(args.www_root, PathBuf::from(DEFAULT_WWW_ROOT));
+    }
+
+    #[test]
+    fn routine_args_override_paths() {
+        let args = RoutineArgs::from_slice(&[
+            "--media-root",
+            "/data/yt",
+            "--www-root",
+            "/srv/site",
+        ])
+        .unwrap();
+
+        assert_eq!(args.media_root, PathBuf::from("/data/yt"));
+        assert_eq!(args.www_root, PathBuf::from("/srv/site"));
+    }
 
     #[test]
     fn collect_channels_dedupes_entries() -> Result<()> {

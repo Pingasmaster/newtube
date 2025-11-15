@@ -4,10 +4,11 @@ if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root." >&2
     exit 1
 fi
-tee /root/software-update-build-run.sh <<'EOF'
+tee /yt/viewtube-update-build-run.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+CURRENT_APP_VERSION="0.1.0"
 REPO_URL="https://github.com/Pingasmaster/viewtube.git"
 APP_DIR="/www/newtube.com/"
 SCREEN_NAME_ROUTINEUPDATE="routineupdate"
@@ -25,7 +26,13 @@ git clone "$REPO_URL" "$APP_DIR"
 cd / && cd "$APP_DIR"
 # Remove uneeded files
 ./cleanup-repo.sh
-rm -f cleanup-repo.sh setup-software.sh
+CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+if [[ "$APP_VERSION" != "$CARGO_VERSION" ]]; then
+    echo "Versions differ, running setup again..."
+    ./setup-software.sh
+    exit 0
+fi
+rm -f cleanup-repo.sh setup-software.sh 
 
 echo "[*] Building with cargo (release)..."
 cargo build --release
@@ -60,7 +67,7 @@ Wants=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/www/newtube.com/
-ExecStart=/root/software-update-build-run.sh
+ExecStart=/yt/viewtube-update-build-run.sh 
 
 # Optional: give it more time for compiling
 TimeoutStartSec=3600
@@ -80,7 +87,7 @@ Unit=software-updater.service
 [Install]
 WantedBy=timers.target
 EOF
-chmod +x /usr/local/bin/software-update-build-run.sh
+chmod +x /yt/viewtube-update-build-run.sh 
 systemctl daemon-reload
 systemctl start software-updater.service
 systemctl daemon-reload

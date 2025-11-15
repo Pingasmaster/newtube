@@ -1,0 +1,46 @@
+name: Release Artifacts
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup override set stable
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY_B64" ]; then
+            echo "RELEASE_SIGNING_KEY secret is not configured" >&2
+            exit 1
+          fi
+          echo "$SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/signing-key.json"
+
+      - name: Package release archives
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p artifacts
+          cargo run --bin installer -- \
+            --package-release \
+            --release-tag "$RELEASE_TAG" \
+            --output-dir artifacts \
+            --signing-key "$RUNNER_TEMP/signing-key.json"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

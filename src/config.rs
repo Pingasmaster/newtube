@@ -7,6 +7,7 @@ use std::{
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/viewtube-env";
 pub const DEFAULT_NEWTUBE_PORT: u16 = 8080;
 pub const DEFAULT_NEWTUBE_HOST: &str = "127.0.0.1";
+pub const DEFAULT_RELEASE_REPO: &str = "Pingasmaster/viewtube";
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvConfig {
@@ -16,6 +17,7 @@ pub struct EnvConfig {
     pub domain_name: Option<String>,
     pub newtube_port: Option<u16>,
     pub newtube_host: Option<String>,
+    pub release_repo: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,7 @@ pub struct RuntimePaths {
     pub www_root: PathBuf,
     pub newtube_port: u16,
     pub newtube_host: String,
+    pub release_repo: String,
 }
 
 pub fn read_env_config(path: &Path) -> Result<Option<EnvConfig>> {
@@ -56,6 +59,11 @@ pub fn read_env_config(path: &Path) -> Result<Option<EnvConfig>> {
                         cfg.newtube_host = Some(value.to_string());
                     }
                 }
+                "RELEASE_REPO" => {
+                    if !value.is_empty() {
+                        cfg.release_repo = Some(value.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -82,11 +90,16 @@ pub fn load_runtime_paths_from(path: impl AsRef<Path>) -> Result<RuntimePaths> {
         .newtube_host
         .clone()
         .unwrap_or_else(|| DEFAULT_NEWTUBE_HOST.to_string());
+    let release_repo = cfg
+        .release_repo
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string());
     Ok(RuntimePaths {
         media_root,
         www_root,
         newtube_port,
         newtube_host,
+        release_repo,
     })
 }
 

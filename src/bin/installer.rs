@@ -288,11 +288,11 @@ fn resolve_domain(
     if let Some(domain) = cli_domain {
         return normalize_domain(&domain);
     }
-    if let Some(existing_domain) = existing.and_then(|cfg| cfg.domain_name.clone()) {
-        if assume_yes || prompt_yes_no(&format!("Use detected domain '{existing_domain}'?"), false)?
-        {
-            return Ok(existing_domain);
-        }
+    if let Some(existing_domain) = existing.and_then(|cfg| cfg.domain_name.clone())
+        && (assume_yes
+            || prompt_yes_no(&format!("Use detected domain '{existing_domain}'?"), false)?)
+    {
+        return Ok(existing_domain);
     }
     prompt_for_domain(assume_yes)
 }
@@ -545,7 +545,7 @@ fn show_status() -> Result<()> {
 
 fn run_command(cmd: &str, args: &[&str]) -> Result<()> {
     let printable = format_command(cmd, args);
-    log_info(&format!("Running: {printable}"));
+    log_info(format!("Running: {printable}"));
     let status = Command::new(cmd)
         .args(args)
         .status()

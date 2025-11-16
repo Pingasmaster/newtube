@@ -1555,9 +1555,7 @@ fn apply_signed_source_archive(
 ) -> Result<()> {
     let verifying_key = load_public_key(pubkey_path)?;
     let metadata = verify_release_signature(artifact, signature, &verifying_key)?;
-    if let Some(expected) =
-        expected_version.filter(|candidate| *candidate != metadata.version)
-    {
+    if let Some(expected) = expected_version.filter(|candidate| *candidate != metadata.version) {
         bail!(
             "Release signature reports version {} but updater expected {}",
             metadata.version,

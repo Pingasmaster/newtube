@@ -5,7 +5,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use blake3::Hasher;
 use clap::{ArgGroup, Parser};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use newtube_tools::config::{
     DEFAULT_CONFIG_PATH, DEFAULT_NEWTUBE_HOST, DEFAULT_NEWTUBE_PORT, DEFAULT_RELEASE_REPO,
     EnvConfig, load_runtime_paths_from, read_env_config,
@@ -25,6 +24,7 @@ use tar::Builder;
 use tempfile::TempDir;
 use ureq::{Agent, Response};
 use walkdir::WalkDir;
+use xz2::{read::XzDecoder, write::XzEncoder};
 
 const DEFAULT_MEDIA_DIR: &str = "/yt";
 const DEFAULT_WWW_DIR: &str = "/www/newtube.com";
@@ -174,7 +174,7 @@ struct Cli {
         long = "source-archive",
         value_name = "PATH",
         requires = "apply_archive",
-        help = "Path to the signed source tarball (.tar.gz)"
+        help = "Path to the signed source tarball (.tar.xz)"
     )]
     source_archive: Option<PathBuf>,
     #[arg(
@@ -1354,8 +1354,8 @@ fn package_release_artifacts(repo_root: &Path, cli: &Cli) -> Result<()> {
     fs::create_dir_all(output_dir)?;
     run_command_in_dir("cargo", &["build", "--release"], repo_root)?;
 
-    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{tag}.tar.gz");
-    let bin_name = format!("{BINARY_ARCHIVE_PREFIX}-{tag}.tar.gz");
+    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{tag}.tar.xz");
+    let bin_name = format!("{BINARY_ARCHIVE_PREFIX}-{tag}.tar.xz");
     let src_path = output_dir.join(&src_name);
     let bin_path = output_dir.join(&bin_name);
 
@@ -1374,7 +1374,10 @@ fn package_release_artifacts(repo_root: &Path, cli: &Cli) -> Result<()> {
 }
 
 fn signature_path_for(archive: &Path) -> PathBuf {
-    archive.with_extension("tar.gz.sig")
+    // Preserve the full archive name (including existing extensions) and just add .sig
+    let mut sig = archive.as_os_str().to_owned();
+    sig.push(".sig");
+    PathBuf::from(sig)
 }
 
 fn package_source_archive(repo_root: &Path, dest: &Path) -> Result<()> {
@@ -1382,7 +1385,7 @@ fn package_source_archive(repo_root: &Path, dest: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let file = File::create(dest)?;
-    let encoder = GzEncoder::new(file, Compression::best());
+    let encoder = XzEncoder::new(file, 9);
     let mut builder = Builder::new(encoder);
     for entry in WalkDir::new(repo_root).into_iter().filter_map(|e| e.ok()) {
         let rel = match entry.path().strip_prefix(repo_root) {
@@ -1433,7 +1436,7 @@ fn package_binary_archive(repo_root: &Path, dest: &Path) -> Result<()> {
     copy_frontend_assets(repo_root, &www_stage)?;
 
     let file = File::create(dest)?;
-    let encoder = GzEncoder::new(file, Compression::best());
+    let encoder = XzEncoder::new(file, 9);
     let mut builder = Builder::new(encoder);
     builder.append_dir_all(Path::new(BINARY_ROOT_DIR).join("bin"), &bin_stage)?;
     builder.append_dir_all(Path::new(BINARY_ROOT_DIR).join("www"), &www_stage)?;
@@ -1507,8 +1510,8 @@ fn auto_update_from_github(
         return Ok(());
     }
 
-    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{}.tar.gz", release.tag_name);
-    let sig_name = format!("{SOURCE_ARCHIVE_PREFIX}-{}.tar.gz.sig", release.tag_name);
+    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{}.tar.xz", release.tag_name);
+    let sig_name = format!("{SOURCE_ARCHIVE_PREFIX}-{}.tar.xz.sig", release.tag_name);
     let src_asset = release
         .assets
         .iter()
@@ -1612,7 +1615,7 @@ fn apply_signed_source_archive(
     ));
 
     let temp = TempDir::new()?;
-    let decoder = GzDecoder::new(File::open(artifact)?);
+    let decoder = XzDecoder::new(File::open(artifact)?);
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(temp.path())?;
 

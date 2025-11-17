@@ -28,14 +28,14 @@ From that point on the machine keeps itself current: every night at 03:00 the up
 
 ## Automatic updates & signed releases
 
-- **Two release artifacts per tag.** GitHub Actions (see `.github/workflows/release.yml`) produces `newtube-src-<tag>.tar.gz` (full repo tree) and `newtube-bin-<tag>.tar.gz` (prebuilt binaries + static assets). Each archive ships with a `.sig` file containing a BLAKE3 digest and an Ed25519 signature.
+- **Two release artifacts per tag.** GitHub Actions (see `.github/workflows/release.yml`) produces `newtube-src-<tag>.tar.xz` (full repo tree) and `newtube-bin-<tag>.tar.xz` (prebuilt binaries + static assets). Each archive ships with a `.sig` file containing a BLAKE3 digest and an Ed25519 signature.
 - **Only the signed source archive feeds automation.** `installer --auto-update` (and the nightly `software-updater.timer`) downloads the latest source tarball + signature from GitHub Releases, verifies them with `<WWW_ROOT>/release-public-key.json`, rebuilds the binaries locally, replaces `/opt/newtube/bin`, refreshes the static assets, and restarts `newtube-backend` + `newtube-routine`. The binary tarball is there for reproducibility/mirrors but is never executed automatically.
 - **Manual/offline updates** use the same verification flow. Download the source tarball and signature and run:
   ```bash
   sudo /opt/newtube/bin/installer \
     --apply-archive \
-    --source-archive /tmp/newtube-src-vX.Y.Z.tar.gz \
-    --source-signature /tmp/newtube-src-vX.Y.Z.tar.gz.sig \
+    --source-archive /tmp/newtube-src-vX.Y.Z.tar.xz \
+    --source-signature /tmp/newtube-src-vX.Y.Z.tar.xz.sig \
     --trusted-pubkey release-public-key.json \
     --config /etc/newtube-env
   ```

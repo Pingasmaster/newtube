@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use blake3::Hasher;
-use clap::{ArgGroup, Parser};
+use clap::{ArgAction, ArgGroup, Parser};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use newtube_tools::config::{
     DEFAULT_CONFIG_PATH, DEFAULT_NEWTUBE_HOST, DEFAULT_NEWTUBE_PORT, DEFAULT_RELEASE_REPO,
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Write, BufReader},
     net::IpAddr,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -24,7 +24,7 @@ use tar::Builder;
 use tempfile::TempDir;
 use ureq::{Agent, Response};
 use walkdir::WalkDir;
-use xz2::{read::XzDecoder, write::XzEncoder};
+use lzma_rs::{xz_compress, xz_decompress};
 
 const DEFAULT_MEDIA_DIR: &str = "/yt";
 const DEFAULT_WWW_DIR: &str = "/www/newtube.com";
@@ -63,6 +63,19 @@ const FRONTEND_SKIP_ENTRIES: &[&str] = &[
     "README.md",
     "LICENSE",
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitSystem {
+    Systemd,
+    OpenRc,
+    BsdRc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Platform {
+    Linux,
+    Bsd,
+}
 
 fn default_pubkey_path_for_www(www_root: &Path) -> PathBuf {
     www_root.join(DEFAULT_PUBLIC_KEY_FILENAME)
@@ -210,6 +223,15 @@ struct Cli {
         help = "Path to the Ed25519 signing key generated via --keygen"
     )]
     signing_key: Option<PathBuf>,
+    #[arg(
+        long = "build-target",
+        value_name = "TRIPLE",
+        num_args = 1..,
+        action = ArgAction::Append,
+        requires = "package_release",
+        help = "Target triple(s) to build for (defaults to host)"
+    )]
+    build_targets: Option<Vec<String>>,
     #[arg(
         long = "keygen",
         help = "Generate an Ed25519 signing keypair used for release packaging"
@@ -359,6 +381,8 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| repo_root.join(DEFAULT_PUBLIC_KEY_FILENAME));
 
+    let platform = detect_platform();
+
     if cli.reinstall {
         uninstall(&media_root, &cli.config)?;
         let install_config = InstallConfig {
@@ -372,6 +396,8 @@ fn main() -> Result<()> {
             release_repo: release_repo.clone(),
             assume_yes: cli.assume_yes,
             pubkey_path: pubkey_destination.clone(),
+            init_system: detect_init_system(platform)?,
+            platform,
         };
         install(install_config, &repo_root, &pubkey_source)?;
         return Ok(());
@@ -393,6 +419,8 @@ fn main() -> Result<()> {
         release_repo,
         assume_yes: cli.assume_yes,
         pubkey_path: pubkey_destination,
+        init_system: detect_init_system(platform)?,
+        platform,
     };
 
     install(install_config, &repo_root, &pubkey_source)
@@ -410,6 +438,8 @@ struct InstallConfig {
     release_repo: String,
     assume_yes: bool,
     pubkey_path: PathBuf,
+    init_system: InitSystem,
+    platform: Platform,
 }
 
 fn install(cfg: InstallConfig, repo_root: &Path, pubkey_source: &Path) -> Result<()> {
@@ -421,37 +451,70 @@ fn install(cfg: InstallConfig, repo_root: &Path, pubkey_source: &Path) -> Result
     ensure_directory(Path::new(BIN_ROOT), 0o750)?;
 
     ensure_service_accounts(&cfg)?;
-    ensure_nginx_installed(cfg.assume_yes)?;
-    deploy_nginx_config(&cfg.domain_name, &cfg.www_root, cfg.assume_yes)?;
+    ensure_nginx_installed(cfg.init_system, cfg.assume_yes)?;
+    deploy_nginx_config(
+        cfg.init_system,
+        &cfg.domain_name,
+        &cfg.www_root,
+        cfg.assume_yes,
+    )?;
 
     write_env_config(&cfg)?;
     install_trusted_pubkey(pubkey_source, &cfg.pubkey_path)?;
-    install_systemd_units(&cfg)?;
+    install_init_units(&cfg)?;
     build_from_workspace(repo_root, &cfg)?;
-
-    run_command("systemctl", &["daemon-reload"])?;
-    run_command("systemctl", &["enable", "--now", BACKEND_SERVICE])?;
-    run_command("systemctl", &["enable", "--now", ROUTINE_SERVICE])?;
-    run_command("systemctl", &["enable", "--now", SOFTWARE_TIMER])?;
-    show_status()?;
+    enable_and_start_services(&cfg)?;
+    show_status(cfg.init_system)?;
 
     Ok(())
 }
 
 fn uninstall(_media_root: &Path, config_path: &Path) -> Result<()> {
     log_info("Stopping timer and removing files");
-    let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_TIMER]);
-    let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_SERVICE]);
-    let _ = run_command_allow_fail("systemctl", &["disable", "--now", BACKEND_SERVICE]);
-    let _ = run_command_allow_fail("systemctl", &["disable", "--now", ROUTINE_SERVICE]);
+    let platform = detect_platform();
+    let init = detect_init_system(platform).unwrap_or(InitSystem::Systemd);
 
-    let systemd_dir = PathBuf::from("/etc/systemd/system");
-    remove_path_if_exists(&systemd_dir.join(SOFTWARE_SERVICE))?;
-    remove_path_if_exists(&systemd_dir.join(SOFTWARE_TIMER))?;
-    remove_path_if_exists(&systemd_dir.join(BACKEND_SERVICE))?;
-    remove_path_if_exists(&systemd_dir.join(ROUTINE_SERVICE))?;
+    match init {
+        InitSystem::Systemd => {
+            let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_TIMER]);
+            let _ = run_command_allow_fail("systemctl", &["disable", "--now", SOFTWARE_SERVICE]);
+            let _ = run_command_allow_fail("systemctl", &["disable", "--now", BACKEND_SERVICE]);
+            let _ = run_command_allow_fail("systemctl", &["disable", "--now", ROUTINE_SERVICE]);
 
-    run_command("systemctl", &["daemon-reload"])?;
+            let systemd_dir = PathBuf::from("/etc/systemd/system");
+            remove_path_if_exists(&systemd_dir.join(SOFTWARE_SERVICE))?;
+            remove_path_if_exists(&systemd_dir.join(SOFTWARE_TIMER))?;
+            remove_path_if_exists(&systemd_dir.join(BACKEND_SERVICE))?;
+            remove_path_if_exists(&systemd_dir.join(ROUTINE_SERVICE))?;
+
+            run_command("systemctl", &["daemon-reload"])?;
+        }
+        InitSystem::OpenRc => {
+            let _ = run_command_allow_fail("rc-service", &[SOFTWARE_SERVICE, "stop"]);
+            let _ = run_command_allow_fail("rc-service", &[BACKEND_SERVICE, "stop"]);
+            let _ = run_command_allow_fail("rc-service", &[ROUTINE_SERVICE, "stop"]);
+            let _ = run_command_allow_fail("rc-update", &["del", BACKEND_SERVICE, "default"]);
+            let _ = run_command_allow_fail("rc-update", &["del", ROUTINE_SERVICE, "default"]);
+            let _ = run_command_allow_fail("rc-update", &["del", SOFTWARE_SERVICE, "default"]);
+
+            for file in [BACKEND_SERVICE, ROUTINE_SERVICE, SOFTWARE_SERVICE] {
+                remove_path_if_exists(&Path::new("/etc/init.d").join(file))?;
+            }
+            remove_path_if_exists(&Path::new("/etc/cron.d").join("newtube-updater"))?;
+        }
+        InitSystem::BsdRc => {
+            let _ = run_command_allow_fail("service", &[SOFTWARE_SERVICE, "stop"]);
+            let _ = run_command_allow_fail("service", &[BACKEND_SERVICE, "stop"]);
+            let _ = run_command_allow_fail("service", &[ROUTINE_SERVICE, "stop"]);
+            for svc in [BACKEND_SERVICE, ROUTINE_SERVICE] {
+                if command_exists("sysrc") {
+                    let _ = run_command_allow_fail("sysrc", &[&format!("{svc}_enable=NO")]);
+                }
+                remove_path_if_exists(&Path::new("/usr/local/etc/rc.d").join(svc))?;
+            }
+            remove_path_if_exists(&Path::new("/etc/cron.d").join("newtube-updater"))?;
+        }
+    }
 
     if config_path.exists() {
         fs::remove_file(config_path)
@@ -721,6 +784,7 @@ fn env_to_install_config(env: EnvConfig, config_path: PathBuf) -> Result<Install
     let www_root = env
         .www_root
         .ok_or_else(|| anyhow!("WWW_ROOT missing from {}", config_path.display()))?;
+    let platform = detect_platform();
     Ok(InstallConfig {
         media_root: media_root.clone(),
         www_root: www_root.clone(),
@@ -738,6 +802,8 @@ fn env_to_install_config(env: EnvConfig, config_path: PathBuf) -> Result<Install
             .unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string()),
         assume_yes: true,
         pubkey_path: default_pubkey_path_for_www(&www_root),
+        init_system: detect_init_system(platform)?,
+        platform,
     })
 }
 
@@ -1102,14 +1168,14 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-fn ensure_nginx_installed(assume_yes: bool) -> Result<()> {
-    if service_exists(NGINX_SERVICE)? {
+fn ensure_nginx_installed(init: InitSystem, assume_yes: bool) -> Result<()> {
+    if service_exists(NGINX_SERVICE, init)? {
         log_info("nginx service detected");
         return Ok(());
     }
     log_info("nginx service not detected");
     if assume_yes || prompt_yes_no("Install nginx via package manager?", false)? {
-        install_nginx_package().context("Unable to install nginx")?;
+        install_nginx_package(init).context("Unable to install nginx")?;
     } else {
         bail!("nginx is required for setup");
     }
@@ -1117,22 +1183,38 @@ fn ensure_nginx_installed(assume_yes: bool) -> Result<()> {
 }
 
 fn ensure_service_accounts(cfg: &InstallConfig) -> Result<()> {
-    ensure_group_exists(NEWTUBE_GROUP)?;
-    ensure_user_exists(BACKEND_USER, NEWTUBE_GROUP, BACKEND_HOME)?;
-    ensure_user_exists(DOWNLOADER_USER, NEWTUBE_GROUP, DOWNLOADER_HOME)?;
+    ensure_group_exists(NEWTUBE_GROUP, cfg.platform)?;
+    ensure_user_exists(BACKEND_USER, NEWTUBE_GROUP, BACKEND_HOME, cfg.platform)?;
+    ensure_user_exists(
+        DOWNLOADER_USER,
+        NEWTUBE_GROUP,
+        DOWNLOADER_HOME,
+        cfg.platform,
+    )?;
     ensure_media_permissions(&cfg.media_root)?;
     Ok(())
 }
 
-fn ensure_group_exists(name: &str) -> Result<()> {
-    match Command::new("getent").args(["group", name]).status() {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(_) | Err(_) => {}
+fn ensure_group_exists(name: &str, platform: Platform) -> Result<()> {
+    match platform {
+        Platform::Linux => {
+            match Command::new("getent").args(["group", name]).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) | Err(_) => {}
+            }
+            run_command("groupadd", &["--system", name])
+        }
+        Platform::Bsd => {
+            match Command::new("getent").args(["group", name]).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) | Err(_) => {}
+            }
+            run_command("pw", &["groupadd", name])
+        }
     }
-    run_command("groupadd", &["--system", name])
 }
 
-fn ensure_user_exists(user: &str, group: &str, home: &str) -> Result<()> {
+fn ensure_user_exists(user: &str, group: &str, home: &str, platform: Platform) -> Result<()> {
     match Command::new("id").args(["-u", user]).status() {
         Ok(status) if status.success() => {
             fs::create_dir_all(home).with_context(|| format!("Creating home directory {home}"))?;
@@ -1143,30 +1225,60 @@ fn ensure_user_exists(user: &str, group: &str, home: &str) -> Result<()> {
 
     fs::create_dir_all(home).with_context(|| format!("Creating home directory {home}"))?;
     let home_owned = home.to_string();
-    let args = [
-        "--system",
-        "--create-home",
-        "--home",
-        home_owned.as_str(),
-        "--shell",
-        "/usr/sbin/nologin",
-        "--gid",
-        group,
-        user,
-    ];
-    run_command("useradd", &args)
+    match platform {
+        Platform::Linux => {
+            let args = [
+                "--system",
+                "--create-home",
+                "--home",
+                home_owned.as_str(),
+                "--shell",
+                "/usr/sbin/nologin",
+                "--gid",
+                group,
+                user,
+            ];
+            run_command("useradd", &args)
+        }
+        Platform::Bsd => {
+            let args = [
+                "useradd",
+                "-n",
+                user,
+                "-g",
+                group,
+                "-d",
+                home_owned.as_str(),
+                "-s",
+                "/usr/sbin/nologin",
+                "-m",
+            ];
+            run_command("pw", &args)
+        }
+    }
 }
 
-fn service_exists(name: &str) -> Result<bool> {
-    let stdout = run_command_capture("systemctl", &["list-unit-files", "--type=service", "--all"])?;
-    let needle = format!("{name}.service");
-    Ok(stdout
-        .lines()
-        .map(str::trim_start)
-        .any(|line| line.starts_with(&needle)))
+fn service_exists(name: &str, init: InitSystem) -> Result<bool> {
+    match init {
+        InitSystem::Systemd => {
+            let stdout =
+                run_command_capture("systemctl", &["list-unit-files", "--type=service", "--all"])?;
+            let needle = format!("{name}.service");
+            Ok(stdout
+                .lines()
+                .map(str::trim_start)
+                .any(|line| line.starts_with(&needle)))
+        }
+        InitSystem::OpenRc => Ok(Path::new("/etc/init.d").join(name).exists()),
+        InitSystem::BsdRc => {
+            let p1 = Path::new("/etc/rc.d").join(name);
+            let p2 = Path::new("/usr/local/etc/rc.d").join(name);
+            Ok(p1.exists() || p2.exists())
+        }
+    }
 }
 
-fn install_nginx_package() -> Result<()> {
+fn install_nginx_package(init: InitSystem) -> Result<()> {
     let manager = detect_package_manager()
         .ok_or_else(|| anyhow!("Could not detect a supported package manager"))?;
     match manager {
@@ -1189,14 +1301,49 @@ fn install_nginx_package() -> Result<()> {
             run_command("zypper", &["refresh"])?;
             run_command("zypper", &["install", "-y", "nginx"])?;
         }
+        "pkg" => {
+            run_command("pkg", &["install", "-y", "nginx"])?;
+        }
+        "pkg_add" => {
+            run_command("pkg_add", &["nginx"])?;
+        }
+        "pkgin" => {
+            run_command("pkgin", &["-y", "install", "nginx"])?;
+        }
         other => bail!("Unsupported package manager {other}"),
     }
-    run_command("systemctl", &["enable", "--now", NGINX_SERVICE])?;
+
+    match init {
+        InitSystem::Systemd => run_command("systemctl", &["enable", "--now", NGINX_SERVICE])?,
+        InitSystem::OpenRc => {
+            run_command("rc-update", &["add", NGINX_SERVICE, "default"])?;
+            run_command("rc-service", &[NGINX_SERVICE, "start"])?;
+        }
+        InitSystem::BsdRc => {
+            if command_exists("sysrc") {
+                run_command("sysrc", &[&format!("{NGINX_SERVICE}_enable=YES")])?;
+            } else {
+                append_rc_conf(&format!("{NGINX_SERVICE}_enable=\"YES\""))?;
+            }
+            run_command("service", &[NGINX_SERVICE, "start"])?;
+        }
+    }
     Ok(())
 }
 
 fn detect_package_manager() -> Option<&'static str> {
-    let managers = ["apt-get", "apt", "dnf", "yum", "pacman", "apk", "zypper"];
+    let managers = [
+        "apt-get",
+        "apt",
+        "dnf",
+        "yum",
+        "pacman",
+        "apk",
+        "zypper",
+        "pkg",
+        "pkg_add",
+        "pkgin",
+    ];
     managers.into_iter().find(|mgr| command_exists(mgr))
 }
 
@@ -1211,12 +1358,66 @@ fn command_exists(bin: &str) -> bool {
     false
 }
 
-fn deploy_nginx_config(domain: &str, www_root: &Path, assume_yes: bool) -> Result<()> {
+fn append_rc_conf(line: &str) -> Result<()> {
+    let path = if Path::new("/etc/rc.conf.local").exists() {
+        PathBuf::from("/etc/rc.conf.local")
+    } else {
+        PathBuf::from("/etc/rc.conf")
+    };
+    let mut contents = String::new();
+    if path.exists() {
+        contents = fs::read_to_string(&path).unwrap_or_default();
+        if contents.lines().any(|l| l.trim() == line.trim()) {
+            return Ok(());
+        }
+    }
+    contents.push_str(line);
+    contents.push('\n');
+    fs::write(&path, contents).with_context(|| format!("Writing {}", path.display()))
+}
+
+fn detect_platform() -> Platform {
+    match env::consts::OS {
+        "freebsd" | "netbsd" | "openbsd" => Platform::Bsd,
+        _ => Platform::Linux,
+    }
+}
+
+fn detect_init_system(platform: Platform) -> Result<InitSystem> {
+    match platform {
+        Platform::Linux => {
+            if Path::new("/run/systemd/system").exists() && command_exists("systemctl") {
+                return Ok(InitSystem::Systemd);
+            }
+            // OpenRC typically provides rc-service and a PID dir under /run/openrc
+            if command_exists("rc-service") {
+                return Ok(InitSystem::OpenRc);
+            }
+            bail!("Unsupported init system: need systemd or OpenRC");
+        }
+        Platform::Bsd => Ok(InitSystem::BsdRc),
+    }
+}
+fn deploy_nginx_config(
+    init: InitSystem,
+    domain: &str,
+    www_root: &Path,
+    assume_yes: bool,
+) -> Result<()> {
     let (config_path, symlink_path) = if Path::new("/etc/nginx/sites-available").is_dir() {
         (
             PathBuf::from("/etc/nginx/sites-available/newtube.conf"),
             Some(PathBuf::from("/etc/nginx/sites-enabled/newtube.conf")),
         )
+    } else if Path::new("/usr/local/etc/nginx/sites-available").is_dir() {
+        (
+            PathBuf::from("/usr/local/etc/nginx/sites-available/newtube.conf"),
+            Some(PathBuf::from(
+                "/usr/local/etc/nginx/sites-enabled/newtube.conf",
+            )),
+        )
+    } else if Path::new("/usr/local/etc/nginx/conf.d").is_dir() {
+        (PathBuf::from("/usr/local/etc/nginx/conf.d/newtube.conf"), None)
     } else {
         (PathBuf::from("/etc/nginx/conf.d/newtube.conf"), None)
     };
@@ -1252,7 +1453,11 @@ fn deploy_nginx_config(domain: &str, www_root: &Path, assume_yes: bool) -> Resul
         symlink(&config_path, symlink_dest)?;
     }
     run_command("nginx", &["-t"])?;
-    run_command("systemctl", &["reload", NGINX_SERVICE])?;
+    match init {
+        InitSystem::Systemd => run_command("systemctl", &["reload", NGINX_SERVICE])?,
+        InitSystem::OpenRc => run_command("rc-service", &[NGINX_SERVICE, "reload"])?,
+        InitSystem::BsdRc => run_command("service", &[NGINX_SERVICE, "reload"])?,
+    }
     Ok(())
 }
 
@@ -1306,6 +1511,141 @@ fn install_systemd_units(cfg: &InstallConfig) -> Result<()> {
     Ok(())
 }
 
+fn install_openrc_units(cfg: &InstallConfig) -> Result<()> {
+    let init_dir = PathBuf::from("/etc/init.d");
+    fs::create_dir_all(&init_dir)?;
+
+    let backend_path = init_dir.join(BACKEND_SERVICE);
+    let backend_contents = format!(
+        "#!/sbin/openrc-run\n\nname=\"newtube backend API\"\ndescription=\"newtube backend API\"\n\ncommand=\"{exec}\"\ncommand_args=\"--config {config}\"\ncommand_user=\"{user}:{group}\"\ndirectory=\"{work}\"\npidfile=\"/run/{service}.pid\"\nsupervisor=\"supervise-daemon\"\n\ndepend() {{\n    need net\n    use dns logger\n}}\n\nstart_pre() {{\n    checkpath --directory --owner {user}:{group} {work}\n}}\n",
+        exec = Path::new(BIN_ROOT).join("backend").display(),
+        config = cfg.config_path.display(),
+        user = BACKEND_USER,
+        group = NEWTUBE_GROUP,
+        work = cfg.media_root.display(),
+        service = BACKEND_SERVICE
+    );
+    fs::write(&backend_path, backend_contents)?;
+    fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o755))?;
+
+    let routine_path = init_dir.join(ROUTINE_SERVICE);
+    let routine_contents = format!(
+        "#!/sbin/openrc-run\n\nname=\"newtube routine refresh\"\ndescription=\"nightly channel refresh\"\n\ncommand=\"{exec}\"\ncommand_args=\"--config {config} --media-root {work} --www-root {www}\"\ncommand_user=\"{user}:{group}\"\ndirectory=\"{work}\"\nsupervisor=\"supervise-daemon\"\npidfile=\"/run/{service}.pid\"\n\ndepend() {{\n    need net\n    use dns logger\n}}\n\nstart_pre() {{\n    checkpath --directory --owner {user}:{group} {work}\n}}\n",
+        exec = Path::new(BIN_ROOT).join("routine_update").display(),
+        config = cfg.config_path.display(),
+        user = DOWNLOADER_USER,
+        group = NEWTUBE_GROUP,
+        work = cfg.media_root.display(),
+        www = cfg.www_root.display(),
+        service = ROUTINE_SERVICE
+    );
+    fs::write(&routine_path, routine_contents)?;
+    fs::set_permissions(&routine_path, fs::Permissions::from_mode(0o755))?;
+
+    install_openrc_updater_cron(cfg)?;
+    Ok(())
+}
+
+fn install_openrc_updater_cron(cfg: &InstallConfig) -> Result<()> {
+    let cron_path = PathBuf::from("/etc/cron.d/newtube-updater");
+    let installer_exec = Path::new(BIN_ROOT).join("installer");
+    let line = format!(
+        "0 3 * * * root {exec} --auto-update --config {config} --trusted-pubkey {pubkey} >/var/log/newtube-updater.log 2>&1\n",
+        exec = installer_exec.display(),
+        config = cfg.config_path.display(),
+        pubkey = cfg.pubkey_path.display()
+    );
+    fs::write(&cron_path, line)?;
+    fs::set_permissions(&cron_path, fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+fn install_bsd_rc_units(cfg: &InstallConfig) -> Result<()> {
+    let rc_dir = PathBuf::from("/usr/local/etc/rc.d");
+    fs::create_dir_all(&rc_dir)?;
+
+    let backend_path = rc_dir.join(BACKEND_SERVICE);
+    let backend_contents = format!(
+        "#!/bin/sh\n# PROVIDE: {svc}\n# REQUIRE: DAEMON NETWORKING\n. /etc/rc.subr\nname=\"{svc}\"\nrcvar={svc}_enable\ncommand=\"/usr/sbin/daemon\"\ncommand_args=\"-f {exec} --config {config}\"\npidfile=\"/var/run/{svc}.pid\"\nstart_precmd=\"{svc}_precmd\"\n{svc}_precmd() {{\n    install -d -o {user} -g {group} {work}\n}}\nload_rc_config $name\n: ${{{svc}_enable:=NO}}\nrun_rc_command \"$1\"\n",
+        svc = BACKEND_SERVICE,
+        exec = Path::new(BIN_ROOT).join("backend").display(),
+        config = cfg.config_path.display(),
+        user = BACKEND_USER,
+        group = NEWTUBE_GROUP,
+        work = cfg.media_root.display()
+    );
+    fs::write(&backend_path, backend_contents)?;
+    fs::set_permissions(&backend_path, fs::Permissions::from_mode(0o755))?;
+
+    let routine_path = rc_dir.join(ROUTINE_SERVICE);
+    let routine_contents = format!(
+        "#!/bin/sh\n# PROVIDE: {svc}\n# REQUIRE: DAEMON NETWORKING\n. /etc/rc.subr\nname=\"{svc}\"\nrcvar={svc}_enable\ncommand=\"/usr/sbin/daemon\"\ncommand_args=\"-f {exec} --config {config} --media-root {work} --www-root {www}\"\npidfile=\"/var/run/{svc}.pid\"\nstart_precmd=\"{svc}_precmd\"\n{svc}_precmd() {{\n    install -d -o {user} -g {group} {work}\n}}\nload_rc_config $name\n: ${{{svc}_enable:=NO}}\nrun_rc_command \"$1\"\n",
+        svc = ROUTINE_SERVICE,
+        exec = Path::new(BIN_ROOT).join("routine_update").display(),
+        config = cfg.config_path.display(),
+        work = cfg.media_root.display(),
+        www = cfg.www_root.display(),
+        user = DOWNLOADER_USER,
+        group = NEWTUBE_GROUP
+    );
+    fs::write(&routine_path, routine_contents)?;
+    fs::set_permissions(&routine_path, fs::Permissions::from_mode(0o755))?;
+
+    install_bsd_rc_updater_cron(cfg)?;
+    Ok(())
+}
+
+fn install_bsd_rc_updater_cron(cfg: &InstallConfig) -> Result<()> {
+    let cron_path = PathBuf::from("/etc/cron.d/newtube-updater");
+    let installer_exec = Path::new(BIN_ROOT).join("installer");
+    let line = format!(
+        "0 3 * * * root {exec} --auto-update --config {config} --trusted-pubkey {pubkey} >/var/log/newtube-updater.log 2>&1\n",
+        exec = installer_exec.display(),
+        config = cfg.config_path.display(),
+        pubkey = cfg.pubkey_path.display()
+    );
+    fs::write(&cron_path, line)?;
+    fs::set_permissions(&cron_path, fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+fn install_init_units(cfg: &InstallConfig) -> Result<()> {
+    match cfg.init_system {
+        InitSystem::Systemd => install_systemd_units(cfg),
+        InitSystem::OpenRc => install_openrc_units(cfg),
+        InitSystem::BsdRc => install_bsd_rc_units(cfg),
+    }
+}
+
+fn enable_and_start_services(cfg: &InstallConfig) -> Result<()> {
+    match cfg.init_system {
+        InitSystem::Systemd => {
+            run_command("systemctl", &["daemon-reload"])?;
+            run_command("systemctl", &["enable", "--now", BACKEND_SERVICE])?;
+            run_command("systemctl", &["enable", "--now", ROUTINE_SERVICE])?;
+            run_command("systemctl", &["enable", "--now", SOFTWARE_TIMER])?;
+        }
+        InitSystem::OpenRc => {
+            run_command("rc-update", &["add", BACKEND_SERVICE, "default"])?;
+            run_command("rc-update", &["add", ROUTINE_SERVICE, "default"])?;
+            run_command("rc-service", &[BACKEND_SERVICE, "restart"])?;
+            run_command("rc-service", &[ROUTINE_SERVICE, "restart"])?;
+        }
+        InitSystem::BsdRc => {
+            if command_exists("sysrc") {
+                run_command("sysrc", &[&format!("{BACKEND_SERVICE}_enable=YES")])?;
+                run_command("sysrc", &[&format!("{ROUTINE_SERVICE}_enable=YES")])?;
+            } else {
+                append_rc_conf(&format!("{BACKEND_SERVICE}_enable=\"YES\""))?;
+                append_rc_conf(&format!("{ROUTINE_SERVICE}_enable=\"YES\""))?;
+            }
+            run_command("service", &[BACKEND_SERVICE, "restart"])?;
+            run_command("service", &[ROUTINE_SERVICE, "restart"])?;
+        }
+    }
+    Ok(())
+}
+
 fn generate_signing_keypair(cli: &Cli) -> Result<()> {
     let dir = cli
         .key_dir
@@ -1352,25 +1692,49 @@ fn package_release_artifacts(repo_root: &Path, cli: &Cli) -> Result<()> {
         .ok_or_else(|| anyhow!("--signing-key is required"))?;
 
     fs::create_dir_all(output_dir)?;
-    run_command_in_dir("cargo", &["build", "--release"], repo_root)?;
-
-    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{tag}.tar.xz");
-    let bin_name = format!("{BINARY_ARCHIVE_PREFIX}-{tag}.tar.xz");
-    let src_path = output_dir.join(&src_name);
-    let bin_path = output_dir.join(&bin_name);
-
-    package_source_archive(repo_root, &src_path)?;
-    package_binary_archive(repo_root, &bin_path)?;
-
+    let targets = resolve_build_targets(cli)?;
     let signing_key = load_signing_key(signing_key_path)?;
+
+    // Source archive is target-independent; build it once.
+    let src_name = format!("{SOURCE_ARCHIVE_PREFIX}-{tag}.tar.xz");
+    let src_path = output_dir.join(&src_name);
+    package_source_archive(repo_root, &src_path)?;
     sign_release_file(&src_path, &signature_path_for(&src_path), &signing_key, tag)?;
-    sign_release_file(&bin_path, &signature_path_for(&bin_path), &signing_key, tag)?;
+
+    for target in targets {
+        run_command_in_dir(
+            "cargo",
+            &["build", "--release", "--target", &target],
+            repo_root,
+        )?;
+
+        let bin_name = format!("{BINARY_ARCHIVE_PREFIX}-{tag}-{target}.tar.xz");
+        let bin_path = output_dir.join(&bin_name);
+        package_binary_archive(repo_root, &bin_path, &target)?;
+        sign_release_file(&bin_path, &signature_path_for(&bin_path), &signing_key, tag)?;
+    }
 
     log_info(format!(
         "Release artifacts written to {}",
         output_dir.display()
     ));
     Ok(())
+}
+
+fn resolve_build_targets(cli: &Cli) -> Result<Vec<String>> {
+    if let Some(list) = &cli.build_targets {
+        return Ok(list.clone());
+    }
+    Ok(vec![detect_host_target_triple()?])
+}
+
+fn detect_host_target_triple() -> Result<String> {
+    let output = run_command_capture("rustc", &["-vV"])?;
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Unable to determine host target triple from rustc -vV"))
 }
 
 fn signature_path_for(archive: &Path) -> PathBuf {
@@ -1384,9 +1748,10 @@ fn package_source_archive(repo_root: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = File::create(dest)?;
-    let encoder = XzEncoder::new(file, 9);
-    let mut builder = Builder::new(encoder);
+    let temp = TempDir::new()?;
+    let tar_path = temp.path().join("source.tar");
+    let tar_file = File::create(&tar_path)?;
+    let mut builder = Builder::new(tar_file);
     for entry in WalkDir::new(repo_root).into_iter().filter_map(|e| e.ok()) {
         let rel = match entry.path().strip_prefix(repo_root) {
             Ok(rel) if rel.as_os_str().is_empty() => continue,
@@ -1404,7 +1769,12 @@ fn package_source_archive(repo_root: &Path, dest: &Path) -> Result<()> {
         }
     }
     builder.finish()?;
-    builder.into_inner()?.finish()?;
+    drop(builder);
+
+    let tar_in = File::open(&tar_path)?;
+    let mut tar_in = BufReader::new(tar_in);
+    let mut dest_file = File::create(dest)?;
+    xz_compress(&mut tar_in, &mut dest_file)?;
     Ok(())
 }
 
@@ -1422,7 +1792,7 @@ fn should_skip_source_entry(rel: &Path) -> bool {
     )
 }
 
-fn package_binary_archive(repo_root: &Path, dest: &Path) -> Result<()> {
+fn package_binary_archive(repo_root: &Path, dest: &Path, target_triple: &str) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1432,21 +1802,30 @@ fn package_binary_archive(repo_root: &Path, dest: &Path) -> Result<()> {
     let www_stage = bundle_root.join("www");
     fs::create_dir_all(&bin_stage)?;
     fs::create_dir_all(&www_stage)?;
-    copy_release_binaries_for_archive(repo_root, &bin_stage)?;
+    copy_release_binaries_for_archive(repo_root, &bin_stage, target_triple)?;
     copy_frontend_assets(repo_root, &www_stage)?;
 
-    let file = File::create(dest)?;
-    let encoder = XzEncoder::new(file, 9);
-    let mut builder = Builder::new(encoder);
+    let tar_path = stage.path().join("binary.tar");
+    let tar_file = File::create(&tar_path)?;
+    let mut builder = Builder::new(tar_file);
     builder.append_dir_all(Path::new(BINARY_ROOT_DIR).join("bin"), &bin_stage)?;
     builder.append_dir_all(Path::new(BINARY_ROOT_DIR).join("www"), &www_stage)?;
     builder.finish()?;
-    builder.into_inner()?.finish()?;
+    drop(builder);
+
+    let tar_in = File::open(&tar_path)?;
+    let mut tar_in = BufReader::new(tar_in);
+    let mut dest_file = File::create(dest)?;
+    xz_compress(&mut tar_in, &mut dest_file)?;
     Ok(())
 }
 
-fn copy_release_binaries_for_archive(repo_root: &Path, dest_dir: &Path) -> Result<()> {
-    let target_dir = repo_root.join("target").join("release");
+fn copy_release_binaries_for_archive(
+    repo_root: &Path,
+    dest_dir: &Path,
+    target_triple: &str,
+) -> Result<()> {
+    let target_dir = repo_root.join("target").join(target_triple).join("release");
     let binaries = ["backend", "download_channel", "routine_update", "installer"];
     for bin in binaries {
         let src = target_dir.join(bin);
@@ -1615,8 +1994,15 @@ fn apply_signed_source_archive(
     ));
 
     let temp = TempDir::new()?;
-    let decoder = XzDecoder::new(File::open(artifact)?);
-    let mut archive = tar::Archive::new(decoder);
+    let tar_path = temp.path().join("source.tar");
+    let input = File::open(artifact)?;
+    let mut input = BufReader::new(input);
+    let mut tar_file = File::create(&tar_path)?;
+    xz_decompress(&mut input, &mut tar_file)?;
+    drop(tar_file);
+
+    let tar_file = File::open(&tar_path)?;
+    let mut archive = tar::Archive::new(tar_file);
     archive.unpack(temp.path())?;
 
     let source_root = temp.path().join(SOURCE_ROOT_DIR);
@@ -1641,9 +2027,23 @@ fn apply_signed_source_archive(
     snapshot.app_version = metadata.version.clone();
     write_env_config(&snapshot)?;
 
-    run_command("systemctl", &["restart", BACKEND_SERVICE])?;
-    run_command("systemctl", &["restart", ROUTINE_SERVICE])?;
-    run_command("systemctl", &["reload", NGINX_SERVICE])?;
+    match snapshot.init_system {
+        InitSystem::Systemd => {
+            run_command("systemctl", &["restart", BACKEND_SERVICE])?;
+            run_command("systemctl", &["restart", ROUTINE_SERVICE])?;
+            run_command("systemctl", &["reload", NGINX_SERVICE])?;
+        }
+        InitSystem::OpenRc => {
+            run_command("rc-service", &[BACKEND_SERVICE, "restart"])?;
+            run_command("rc-service", &[ROUTINE_SERVICE, "restart"])?;
+            run_command("rc-service", &[NGINX_SERVICE, "reload"])?;
+        }
+        InitSystem::BsdRc => {
+            run_command("service", &[BACKEND_SERVICE, "restart"])?;
+            run_command("service", &[ROUTINE_SERVICE, "restart"])?;
+            run_command("service", &[NGINX_SERVICE, "reload"])?;
+        }
+    }
     Ok(())
 }
 
@@ -1743,10 +2143,23 @@ struct ReleaseSignature {
     signature: String,
 }
 
-fn show_status() -> Result<()> {
-    let _ = run_command_allow_fail("systemctl", &["status", BACKEND_SERVICE]);
-    let _ = run_command_allow_fail("systemctl", &["status", SOFTWARE_TIMER]);
-    let _ = run_command_allow_fail("systemctl", &["list-timers"]);
+fn show_status(init: InitSystem) -> Result<()> {
+    match init {
+        InitSystem::Systemd => {
+            let _ = run_command_allow_fail("systemctl", &["status", BACKEND_SERVICE]);
+            let _ = run_command_allow_fail("systemctl", &["status", SOFTWARE_TIMER]);
+            let _ = run_command_allow_fail("systemctl", &["list-timers"]);
+        }
+        InitSystem::OpenRc => {
+            let _ = run_command_allow_fail("rc-service", &[BACKEND_SERVICE, "status"]);
+            let _ = run_command_allow_fail("rc-service", &[ROUTINE_SERVICE, "status"]);
+            let _ = run_command_allow_fail("rc-status", &["default"]);
+        }
+        InitSystem::BsdRc => {
+            let _ = run_command_allow_fail("service", &[BACKEND_SERVICE, "status"]);
+            let _ = run_command_allow_fail("service", &[ROUTINE_SERVICE, "status"]);
+        }
+    }
     Ok(())
 }
 

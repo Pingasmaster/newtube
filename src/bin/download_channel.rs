@@ -205,12 +205,10 @@ struct FormatEntry {
     format_id: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 /// Full `yt-dlp --dump-single-json` payload. Only a subset of fields are read
 /// but everything is left optional because older videos may lack metadata.
 struct VideoInfo {
-    id: String,
     title: Option<String>,
     fulltitle: Option<String>,
     description: Option<String>,
@@ -229,7 +227,6 @@ struct VideoInfo {
     duration: Option<i64>,
     #[serde(rename = "duration_string")]
     duration_string: Option<String>,
-    thumbnails: Option<Vec<ThumbnailInfo>>,
     tags: Option<Vec<String>>,
     comment_count: Option<i64>,
     #[serde(default)]
@@ -239,19 +236,9 @@ struct VideoInfo {
     formats: Option<Vec<FormatInfo>>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct ThumbnailInfo {
-    url: Option<String>,
-    width: Option<i64>,
-    height: Option<i64>,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SubtitleInfo {
     url: Option<String>,
-    ext: Option<String>,
     name: Option<String>,
 }
 
@@ -273,7 +260,6 @@ struct FormatInfo {
     dynamic_range: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct RawComment {
     id: String,
@@ -291,8 +277,6 @@ struct RawComment {
     author_is_uploader: bool,
     #[serde(default)]
     author_is_channel_owner: bool,
-    #[serde(default)]
-    is_favorited: bool,
     #[serde(default)]
     reply_count: Option<i64>,
     #[serde(default)]
@@ -1468,7 +1452,6 @@ mod tests {
 
     fn sample_video_info() -> VideoInfo {
         VideoInfo {
-            id: "abc".into(),
             title: Some("Sample Title".into()),
             fulltitle: Some("Sample Title".into()),
             description: Some("desc".into()),
@@ -1484,11 +1467,6 @@ mod tests {
             channel_follower_count: Some(100),
             duration: Some(120),
             duration_string: None,
-            thumbnails: Some(vec![ThumbnailInfo {
-                url: Some("https://img/1.jpg".into()),
-                width: Some(100),
-                height: Some(100),
-            }]),
             tags: Some(vec!["tech".into()]),
             comment_count: Some(5),
             subtitles: Some(HashMap::new()),
@@ -1736,7 +1714,6 @@ exit 0
             "en".into(),
             vec![SubtitleInfo {
                 url: Some("https://remote/en.vtt".into()),
-                ext: Some("vtt".into()),
                 name: Some("English".into()),
             }],
         );
@@ -1762,7 +1739,6 @@ exit 0
             "en".into(),
             vec![SubtitleInfo {
                 url: Some("https://remote/en.vtt".into()),
-                ext: Some("vtt".into()),
                 name: Some("English".into()),
             }],
         );

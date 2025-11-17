@@ -5,8 +5,68 @@ on:
     types: [published]
 
 jobs:
-  package:
+  gen-targets:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: List linux/bsd targets
+        id: list
+        run: |
+          set -e
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustc +stable --print target-list \
+            | grep -Ei 'linux|bsd' \
+            | jq -R . \
+            | jq -s '{include: map({target: .})}' \
+            | tee matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+
+  package-src:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove repo-specific Cargo config
+        run: rm -rf .cargo
+      - name: Install Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable --component rustfmt --component clippy
+          rustup override set stable
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY_B64" ]; then
+            echo "RELEASE_SIGNING_KEY secret is not configured" >&2
+            exit 1
+          fi
+          echo "$SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/signing-key.json"
+      - name: Build and sign source archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p artifacts
+          cargo run --bin installer -- \
+            --package-release \
+            --release-tag "$RELEASE_TAG" \
+            --output-dir artifacts \
+            --signing-key "$RUNNER_TEMP/signing-key.json"
+      - name: Upload source assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/newtube-src-*.tar.xz
+            artifacts/newtube-src-*.tar.xz.sig
+
+  package:
+    needs: [gen-targets, package-src]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.gen-targets.outputs.matrix) }}
     permissions:
       contents: write
     steps:
@@ -21,6 +81,7 @@ jobs:
           rustup set profile minimal
           rustup toolchain install stable --component rustfmt --component clippy
           rustup override set stable
+          rustup target add ${{ matrix.target }}
 
       - name: Prepare signing key
         env:
@@ -32,7 +93,7 @@ jobs:
           fi
           echo "$SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/signing-key.json"
 
-      - name: Package release archives
+      - name: Package target ${{ matrix.target }}
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -41,9 +102,10 @@ jobs:
             --package-release \
             --release-tag "$RELEASE_TAG" \
             --output-dir artifacts \
-            --signing-key "$RUNNER_TEMP/signing-key.json"
+            --signing-key "$RUNNER_TEMP/signing-key.json" \
+            --build-target "${{ matrix.target }}"
 
-      - name: Upload release assets
+      - name: Upload binary assets
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/*${{ matrix.target }}*

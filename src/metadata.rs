@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use anyhow::{Context, Result, anyhow, bail};
+use libsql::{Connection, Database, params};
 use serde::{Deserialize, Serialize};
 
 /// Description of a single downloadable media source (e.g. 1080p mp4).
@@ -114,10 +114,10 @@ pub struct CommentRecord {
     pub reply_count: Option<i64>,
 }
 
-/// Wrapper around the SQLite connection that performs read/write operations.
+/// Wrapper around the SQLite-compatible connection that performs read/write operations.
 #[derive(Debug)]
 pub struct MetadataStore {
-    conn: Connection,
+    db: Database,
 }
 
 impl MetadataStore {
@@ -129,25 +129,18 @@ impl MetadataStore {
                 .with_context(|| format!("creating metadata directory {}", parent.display()))?;
         }
 
-        let conn = Connection::open(path)
+        let db = Database::open_local(path)
             .with_context(|| format!("opening metadata DB {}", path.display()))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("enabling WAL mode for metadata DB")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .context("setting metadata DB synchronous mode")?;
-
-        let mut store = Self { conn };
+        let store = Self { db };
         store.ensure_tables()?;
         Ok(store)
     }
 
-    /// Runs the SQL required to create the tables if they do not already
-    /// exist. Wrapped in a transaction so a failure leaves the DB untouched.
-    fn ensure_tables(&mut self) -> Result<()> {
-        let tx = self.conn.transaction()?;
-
-        tx.execute_batch(
+    /// Runs the SQL required to create the tables if they do not already exist.
+    fn ensure_tables(&self) -> Result<()> {
+        let conn = self.db.connect()?;
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS videos (
                 videoid TEXT PRIMARY KEY,
@@ -211,8 +204,6 @@ impl MetadataStore {
             CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_comment_id);
             "#,
         )?;
-
-        tx.commit()?;
         Ok(())
     }
 

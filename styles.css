@@ -354,6 +354,119 @@ body {
     margin-left: 240px;
 }
 
+.page-home .content-section {
+    padding: 24px;
+}
+
+.page-home .home-section {
+    padding: 0;
+}
+
+.page-home .section-title {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 16px 0;
+}
+
+.page-home .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.page-home .history-item {
+    display: flex;
+    gap: 12px;
+    align-items: stretch;
+    text-decoration: none;
+    color: inherit;
+    background: #171717;
+    border: 1px solid #272727;
+    border-radius: 12px;
+    padding: 12px;
+}
+
+.page-home .history-thumb {
+    width: 180px;
+    aspect-ratio: 16 / 9;
+    background: #222;
+    border-radius: 10px;
+    position: relative;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.page-home .history-progress {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 4px;
+    background: #ff0033;
+}
+
+.page-home .history-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    justify-content: center;
+    min-width: 0;
+}
+
+.page-home .history-title {
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 1.4;
+}
+
+.page-home .history-channel,
+.page-home .history-updated {
+    color: #aaa;
+    font-size: 12px;
+}
+
+.page-home .subscriptions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px;
+}
+
+.page-home .subscription-card {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 14px;
+    background: #171717;
+    border: 1px solid #272727;
+    border-radius: 12px;
+}
+
+.page-home .subscription-avatar {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: #303030;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+}
+
+.page-home .subscription-name {
+    font-weight: 600;
+}
+
+.page-home .subscription-meta {
+    font-size: 12px;
+    color: #aaa;
+}
+
+.page-home .user-info-card {
+    max-width: 720px;
+    margin-top: 4px;
+}
+
 /* Home Page - Chips */
 .page-home .chips-container {
     display: flex;

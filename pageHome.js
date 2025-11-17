@@ -71,34 +71,35 @@ class Header extends Component {
 
 // Sidebar Component
 class Sidebar extends Component {
-    constructor(onStateChange) {
+    constructor(onStateChange, onNavigate) {
         super();
         this.state = 'normal'; // normal, reduced, none
         this.viewportMode = 'desktop';
         this.isExpanded = true;
         this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
+        this.onNavigate = typeof onNavigate === 'function' ? onNavigate : null;
         this.resizeHandler = null;
         this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
         this.userDataListener = null;
+        this.activeItem = 'home';
 
         // Items shown in reduced state
         this.reducedItems = [
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/></svg>', text: 'Home', active: true },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M330-270h80v-340H290v80h40v260Zm200 0h60q33 0 56.5-23.5T670-350v-180q0-33-23.5-56.5T590-610h-60q-33 0-56.5 23.5T450-530v180q0 33 23.5 56.5T530-270Zm0-80v-180h60v180h-60ZM360-840v-80h240v80H360ZM480-80q-74 0-139.5-28.5T226-186q-49-49-77.5-114.5T120-440q0-74 28.5-139.5T226-694q49-49 114.5-77.5T480-800q62 0 119 20t107 58l56-56 56 56-56 56q38 50 58 107t20 119q0 74-28.5 139.5T734-186q-49 49-114.5 77.5T480-80Zm0-80q116 0 198-82t82-198q0-116-82-198t-198-82q-116 0-198 82t-82 198q0 116 82 198t198 82Zm0-280Z"/></svg>', text: 'Shorts' },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M160-80q-33 0-56.5-23.5T80-160v-400q0-33 23.5-56.5T160-640h640q33 0 56.5 23.5T880-560v400q0 33-23.5 56.5T800-80H160Zm0-80h640v-400H160v400Zm240-40 240-160-240-160v320ZM160-680v-80h640v80H160Zm120-120v-80h400v80H280ZM160-160v-400 400Z"/></svg>', text: 'Subscriptions' },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-480q81 0 169-16.5T800-540v400q-60 27-146 43.5T480-80q-88 0-174-16.5T160-140v-400q63 27 151 43.5T480-480Zm240 280v-230q-50 14-115.5 22T480-400q-59 0-124.5-8T240-430v230q50 18 115 29t125 11q60 0 125-11t115-29ZM480-880q66 0 113 47t47 113q0 66-47 113t-113 47q-66 0-113-47t-47-113q0-66 47-113t113-47Zm0 240q33 0 56.5-23.5T560-720q0-33-23.5-56.5T480-800q-33 0-56.5 23.5T400-720q0 33 23.5 56.5T480-640Zm0-80Zm0 425Z"/></svg>', text: 'You' },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-120q-138 0-240.5-91.5T122-440h82q14 104 92.5 172T480-200q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h110v80H120v-240h80v94q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm112-192L440-464v-216h80v184l128 128-56 56Z"/></svg>', text: 'History' }
+            { key: 'home', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/></svg>', text: 'Home' },
+            { key: 'shorts', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M330-270h80v-340H290v80h40v260Zm200 0h60q33 0 56.5-23.5T670-350v-180q0-33-23.5-56.5T590-610h-60q-33 0-56.5 23.5T450-530v180q0 33 23.5 56.5T530-270Zm0-80v-180h60v180h-60ZM360-840v-80h240v80H360ZM480-80q-74 0-139.5-28.5T226-186q-49-49-77.5-114.5T120-440q0-74 28.5-139.5T226-694q49-49 114.5-77.5T480-800q62 0 119 20t107 58l56-56 56 56-56 56q38 50 58 107t20 119q0 74-28.5 139.5T734-186q-49 49-114.5 77.5T480-80Zm0-80q116 0 198-82t82-198q0-116-82-198t-198-82q-116 0-198 82t-82 198q0 116 82 198t198 82Zm0-280Z"/></svg>', text: 'Shorts' },
+            { key: 'subscriptions', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M160-80q-33 0-56.5-23.5T80-160v-400q0-33 23.5-56.5T160-640h640q33 0 56.5 23.5T880-560v400q0 33-23.5 56.5T800-80H160Zm0-80h640v-400H160v400Zm240-40 240-160-240-160v320ZM160-680v-80h640v80H160Zm120-120v-80h400v80H280ZM160-160v-400 400Z"/></svg>', text: 'Subscriptions' },
+            { key: 'you', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-480q81 0 169-16.5T800-540v400q-60 27-146 43.5T480-80q-88 0-174-16.5T160-140v-400q63 27 151 43.5T480-480Zm240 280v-230q-50 14-115.5 22T480-400q-59 0-124.5-8T240-430v230q50 18 115 29t125 11q60 0 125-11t115-29ZM480-880q66 0 113 47t47 113q0 66-47 113t-113 47q-66 0-113-47t-47-113q0-66 47-113t113-47Zm0 240q33 0 56.5-23.5T560-720q0-33-23.5-56.5T480-800q-33 0-56.5 23.5T400-720q0 33 23.5 56.5T480-640Zm0-80Zm0 425Z"/></svg>', text: 'You' },
+            { key: 'history', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-120q-138 0-240.5-91.5T122-440h82q14 104 92.5 172T480-200q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h110v80H120v-240h80v94q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm112-192L440-464v-216h80v184l128 128-56 56Z"/></svg>', text: 'History' }
         ];
         
         // Items shown in normal state
         this.normalItems = [
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/></svg>', text: 'Home', active: true },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M330-270h80v-340H290v80h40v260Zm200 0h60q33 0 56.5-23.5T670-350v-180q0-33-23.5-56.5T590-610h-60q-33 0-56.5 23.5T450-530v180q0 33 23.5 56.5T530-270Zm0-80v-180h60v180h-60ZM360-840v-80h240v80H360ZM480-80q-74 0-139.5-28.5T226-186q-49-49-77.5-114.5T120-440q0-74 28.5-139.5T226-694q49-49 114.5-77.5T480-800q62 0 119 20t107 58l56-56 56 56-56 56q38 50 58 107t20 119q0 74-28.5 139.5T734-186q-49 49-114.5 77.5T480-80Zm0-80q116 0 198-82t82-198q0-116-82-198t-198-82q-116 0-198 82t-82 198q0 116 82 198t198 82Zm0-280Z"/></svg>', text: 'Shorts' },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M160-80q-33 0-56.5-23.5T80-160v-400q0-33 23.5-56.5T160-640h640q33 0 56.5 23.5T880-560v400q0 33-23.5 56.5T800-80H160Zm0-80h640v-400H160v400Zm240-40 240-160-240-160v320ZM160-680v-80h640v80H160Zm120-120v-80h400v80H280ZM160-160v-400 400Z"/></svg>', text: 'Subscriptions' },
+            { key: 'home', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M240-200h120v-240h240v240h120v-360L480-740 240-560v360Zm-80 80v-480l320-240 320 240v480H520v-240h-80v240H160Zm320-350Z"/></svg>', text: 'Home' },
+            { key: 'shorts', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M330-270h80v-340H290v80h40v260Zm200 0h60q33 0 56.5-23.5T670-350v-180q0-33-23.5-56.5T590-610h-60q-33 0-56.5 23.5T450-530v180q0 33 23.5 56.5T530-270Zm0-80v-180h60v180h-60ZM360-840v-80h240v80H360ZM480-80q-74 0-139.5-28.5T226-186q-49-49-77.5-114.5T120-440q0-74 28.5-139.5T226-694q49-49 114.5-77.5T480-800q62 0 119 20t107 58l56-56 56 56-56 56q38 50 58 107t20 119q0 74-28.5 139.5T734-186q-49 49-114.5 77.5T480-80Zm0-80q116 0 198-82t82-198q0-116-82-198t-198-82q-116 0-198 82t-82 198q0 116 82 198t198 82Zm0-280Z"/></svg>', text: 'Shorts' },
+            { key: 'subscriptions', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M160-80q-33 0-56.5-23.5T80-160v-400q0-33 23.5-56.5T160-640h640q33 0 56.5 23.5T880-560v400q0 33-23.5 56.5T800-80H160Zm0-80h640v-400H160v400Zm240-40 240-160-240-160v320ZM160-680v-80h640v80H160Zm120-120v-80h400v80H280ZM160-160v-400 400Z"/></svg>', text: 'Subscriptions' },
             { divider: true },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-480q81 0 169-16.5T800-540v400q-60 27-146 43.5T480-80q-88 0-174-16.5T160-140v-400q63 27 151 43.5T480-480Zm240 280v-230q-50 14-115.5 22T480-400q-59 0-124.5-8T240-430v230q50 18 115 29t125 11q60 0 125-11t115-29ZM480-880q66 0 113 47t47 113q0 66-47 113t-113 47q-66 0-113-47t-47-113q0-66 47-113t113-47Zm0 240q33 0 56.5-23.5T560-720q0-33-23.5-56.5T480-800q-33 0-56.5 23.5T400-720q0 33 23.5 56.5T480-640Zm0-80Zm0 425Z"/></svg>', text: 'You' },
-            { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-120q-138 0-240.5-91.5T122-440h82q14 104 92.5 172T480-200q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h110v80H120v-240h80v94q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm112-192L440-464v-216h80v184l128 128-56 56Z"/></svg>', text: 'History' },
-            { divider: true },
+            { key: 'you', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-480q81 0 169-16.5T800-540v400q-60 27-146 43.5T480-80q-88 0-174-16.5T160-140v-400q63 27 151 43.5T480-480Zm240 280v-230q-50 14-115.5 22T480-400q-59 0-124.5-8T240-430v230q50 18 115 29t125 11q60 0 125-11t115-29ZM480-880q66 0 113 47t47 113q0 66-47 113t-113 47q-66 0-113-47t-47-113q0-66 47-113t113-47Zm0 240q33 0 56.5-23.5T560-720q0-33-23.5-56.5T480-800q-33 0-56.5 23.5T400-720q0 33 23.5 56.5T480-640Zm0-80Zm0 425Z"/></svg>', text: 'You' },
+            { key: 'history', icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M480-120q-138 0-240.5-91.5T122-440h82q14 104 92.5 172T480-200q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h110v80H120v-240h80v94q51-64 124.5-99T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm112-192L440-464v-216h80v184l128 128-56 56Z"/></svg>', text: 'History' },
             { section: 'Explore' },
             { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="M400-120q-66 0-113-47t-47-113q0-66 47-113t113-47q23 0 42.5 5.5T480-418v-422h240v160H560v400q0 66-47 113t-113 47Z"/></svg>', text: 'Music' },
             { icon: '<svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24" fill="currentColor"><path d="m160-800 80 160h120l-80-160h80l80 160h120l-80-160h80l80 160h120l-80-160h120q33 0 56.5 23.5T880-720v480q0 33-23.5 56.5T800-160H160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800Zm0 240v320h640v-320H160Zm0 0v320-320Z"/></svg>', text: 'Movies & TV' },
@@ -184,7 +185,6 @@ class Sidebar extends Component {
         // Choose which items to display
         const items = this.state === 'reduced' ? this.reducedItems : this.normalItems;
         
-        let youInfoInserted = false;
         items.forEach(item => {
             if (item.divider) {
                 const divider = document.createElement('div');
@@ -198,28 +198,39 @@ class Sidebar extends Component {
                 this.element.appendChild(section);
             } else {
                 const sidebarItem = document.createElement('div');
-                sidebarItem.className = 'sidebar-item' + (item.active ? ' active' : '');
+                const isActive = item.key && item.key === this.activeItem;
+                sidebarItem.className = 'sidebar-item' + (isActive ? ' active' : '');
+                if (item.key) {
+                    sidebarItem.dataset.key = item.key;
+                }
                 sidebarItem.innerHTML = `
                     <span class="sidebar-icon">${item.icon}</span>
                     <span class="sidebar-text">${item.text}</span>
                 `;
+                sidebarItem.addEventListener('click', () => this.handleItemClick(item));
                 this.element.appendChild(sidebarItem);
-
-                if (
-                    !youInfoInserted &&
-                    this.state === 'normal' &&
-                    item.text === 'You'
-                ) {
-                    const infoBlock = this.createUserDataInfo();
-                    if (infoBlock) {
-                        this.element.appendChild(infoBlock);
-                        youInfoInserted = true;
-                    }
-                }
             }
         });
 
         this.notifyStateChange();
+    }
+
+    handleItemClick(item) {
+        if (!item || !item.key) {
+            return;
+        }
+        this.activeItem = item.key;
+        if (typeof this.onNavigate === 'function') {
+            this.onNavigate(item.key);
+        }
+        this.render();
+    }
+
+    setActiveItem(key) {
+        if (key && this.activeItem !== key) {
+            this.activeItem = key;
+            this.render();
+        }
     }
 
     createUserDataInfo() {
@@ -693,6 +704,10 @@ class MainContent extends Component {
         this.videoGrid = new VideoGrid();
         this.sidebarState = 'normal';
         this.resizeHandler = null;
+        this.currentView = 'home';
+        this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
+        this.userDataListener = null;
+        this.homeVideos = [];
     }
 
     init() {
@@ -702,9 +717,25 @@ class MainContent extends Component {
 
         const chipsElement = this.chips.init();
         const gridElement = this.videoGrid.init();
-        
-        this.element.appendChild(chipsElement);
-        this.element.appendChild(gridElement);
+
+        this.homeSection = document.createElement('div');
+        this.homeSection.className = 'content-section home-section';
+        this.homeSection.appendChild(chipsElement);
+        this.homeSection.appendChild(gridElement);
+
+        this.historySection = document.createElement('div');
+        this.historySection.className = 'content-section history-section';
+
+        this.youSection = document.createElement('div');
+        this.youSection.className = 'content-section you-section';
+
+        this.subscriptionsSection = document.createElement('div');
+        this.subscriptionsSection.className = 'content-section subscriptions-section';
+
+        this.element.appendChild(this.homeSection);
+        this.element.appendChild(this.historySection);
+        this.element.appendChild(this.youSection);
+        this.element.appendChild(this.subscriptionsSection);
 
         // Set initial margin based on screen size
         this.updateMargin();
@@ -713,12 +744,23 @@ class MainContent extends Component {
         this.resizeHandler = () => this.updateMargin();
         window.addEventListener('resize', this.resizeHandler);
 
+        if (this.userDataStore && !this.userDataListener) {
+            this.userDataListener = () => {
+                if (this.currentView === 'history') this.renderHistory();
+                if (this.currentView === 'you') this.renderYouSection();
+                if (this.currentView === 'subscriptions') this.renderSubscriptions();
+            };
+            window.addEventListener('newtube:userdata', this.userDataListener);
+        }
+
+        this.setView('home');
         return this.element;
     }
 
     setVideos(videos) {
+        this.homeVideos = Array.isArray(videos) ? videos : [];
         if (this.videoGrid) {
-            this.videoGrid.setVideos(videos);
+            this.videoGrid.setVideos(this.homeVideos);
         }
     }
 
@@ -755,9 +797,302 @@ class MainContent extends Component {
         this.updateMargin();
     }
 
+    setView(view = 'home') {
+        this.currentView = view;
+
+        // Toggle visibility
+        const isHome = view === 'home' || view === 'shorts';
+        this.homeSection.style.display = isHome ? '' : 'none';
+        this.historySection.style.display = view === 'history' ? '' : 'none';
+        this.youSection.style.display = view === 'you' ? '' : 'none';
+        this.subscriptionsSection.style.display = view === 'subscriptions' ? '' : 'none';
+
+        if (view === 'history') this.renderHistory();
+        if (view === 'you') this.renderYouSection();
+        if (view === 'subscriptions') this.renderSubscriptions();
+
+        // Maintain margin classes for chips sticky effect
+        this.updateMargin();
+    }
+
+    renderHistory() {
+        if (!this.historySection) return;
+        this.historySection.innerHTML = '';
+
+        const title = document.createElement('h2');
+        title.className = 'section-title';
+        title.textContent = 'History';
+        this.historySection.appendChild(title);
+
+        if (!this.userDataStore) {
+            const msg = document.createElement('p');
+            msg.textContent = 'History is unavailable in this session.';
+            this.historySection.appendChild(msg);
+            return;
+        }
+
+        const snapshot = this.userDataStore.getSnapshot();
+        const entries = Object.entries(snapshot.watchHistory || {}).map(([videoid, entry]) =>
+            Object.assign({ videoid }, entry || {})
+        );
+
+        if (entries.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'video-grid-placeholder';
+            empty.textContent = 'You have not played any videos yet.';
+            this.historySection.appendChild(empty);
+            return;
+        }
+
+        entries.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+        const list = document.createElement('div');
+        list.className = 'history-list';
+
+        entries.forEach((entry, index) => {
+            const item = document.createElement('a');
+            item.className = 'history-item';
+            item.href = entry.videoid ? `/watch?v=${encodeURIComponent(entry.videoid)}` : '#';
+
+            const thumb = document.createElement('div');
+            thumb.className = 'history-thumb';
+            if (entry.thumbnail) {
+                thumb.style.backgroundImage = `url(${entry.thumbnail})`;
+                thumb.style.backgroundSize = 'cover';
+                thumb.style.backgroundPosition = 'center';
+            } else {
+                thumb.style.background = this.videoGrid.colors[index % this.videoGrid.colors.length];
+            }
+            if (typeof entry.progress === 'number') {
+                const bar = document.createElement('div');
+                bar.className = 'history-progress';
+                bar.style.width = `${Math.min(1, entry.progress) * 100}%`;
+                thumb.appendChild(bar);
+            }
+            item.appendChild(thumb);
+
+            const meta = document.createElement('div');
+            meta.className = 'history-meta';
+
+            const titleEl = document.createElement('div');
+            titleEl.className = 'history-title';
+            titleEl.textContent = entry.title || 'Untitled video';
+            meta.appendChild(titleEl);
+
+            const channel = document.createElement('div');
+            channel.className = 'history-channel';
+            channel.textContent = entry.author || 'Unknown channel';
+            meta.appendChild(channel);
+
+            const updated = document.createElement('div');
+            updated.className = 'history-updated';
+            updated.textContent = `Last watched ${this.formatRelativeTime(entry.updatedAt)}`;
+            meta.appendChild(updated);
+
+            item.appendChild(meta);
+            list.appendChild(item);
+        });
+
+        this.historySection.appendChild(list);
+    }
+
+    renderYouSection() {
+        if (!this.youSection) return;
+        this.youSection.innerHTML = '';
+
+        const title = document.createElement('h2');
+        title.className = 'section-title';
+        title.textContent = 'You';
+        this.youSection.appendChild(title);
+
+        if (!this.userDataStore) {
+            const msg = document.createElement('p');
+            msg.textContent = 'Your stats are unavailable in this session.';
+            this.youSection.appendChild(msg);
+            return;
+        }
+
+        const info = this.buildUserDataInfo();
+        if (info) {
+            this.youSection.appendChild(info);
+        }
+    }
+
+    renderSubscriptions() {
+        if (!this.subscriptionsSection) return;
+        this.subscriptionsSection.innerHTML = '';
+
+        const title = document.createElement('h2');
+        title.className = 'section-title';
+        title.textContent = 'Subscriptions';
+        this.subscriptionsSection.appendChild(title);
+
+        if (!this.userDataStore) {
+            const msg = document.createElement('p');
+            msg.textContent = 'Subscriptions are unavailable in this session.';
+            this.subscriptionsSection.appendChild(msg);
+            return;
+        }
+
+        const snapshot = this.userDataStore.getSnapshot();
+        const subs = Object.entries(snapshot.subscriptions || {}).map(([channelId, entry]) =>
+            Object.assign({ channelId }, entry || {})
+        );
+
+        if (subs.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'video-grid-placeholder';
+            empty.textContent = 'No subscriptions yet. Subscribe to channels to see them here.';
+            this.subscriptionsSection.appendChild(empty);
+            return;
+        }
+
+        subs.sort((a, b) => (b.subscribedAt || 0) - (a.subscribedAt || 0));
+
+        const grid = document.createElement('div');
+        grid.className = 'subscriptions-grid';
+
+        subs.forEach((sub, index) => {
+            const card = document.createElement('div');
+            card.className = 'subscription-card';
+
+            const avatar = document.createElement('div');
+            avatar.className = 'subscription-avatar';
+            avatar.style.background = this.videoGrid.colors[(index + 2) % this.videoGrid.colors.length];
+            avatar.textContent = this.videoGrid.getAvatarInitial(sub.name || sub.channelId);
+            card.appendChild(avatar);
+
+            const body = document.createElement('div');
+            body.className = 'subscription-body';
+
+            const name = document.createElement('div');
+            name.className = 'subscription-name';
+            name.textContent = sub.name || sub.channelId;
+            body.appendChild(name);
+
+            const meta = document.createElement('div');
+            meta.className = 'subscription-meta';
+            const dateText = sub.subscribedAt
+                ? `Subscribed ${this.formatRelativeTime(sub.subscribedAt)}`
+                : 'Subscribed';
+            meta.textContent = dateText;
+            body.appendChild(meta);
+
+            card.appendChild(body);
+            grid.appendChild(card);
+        });
+
+        this.subscriptionsSection.appendChild(grid);
+    }
+
+    buildUserDataInfo() {
+        if (!this.userDataStore) {
+            return null;
+        }
+
+        const stats = this.userDataStore.getStats();
+        const info = document.createElement('div');
+        info.className = 'sidebar-info user-info-card';
+
+        const title = document.createElement('strong');
+        title.textContent = 'Your data stays on this device';
+        info.appendChild(title);
+
+        const copy = document.createElement('p');
+        copy.textContent =
+            'Watch history, likes, dislikes, playlists, and subscriptions are saved locally in this browser.';
+        info.appendChild(copy);
+
+        const sync = document.createElement('p');
+        sync.textContent =
+            'Export a JSON backup to sync across devices, then import it from here on the destination device.';
+        info.appendChild(sync);
+
+        const actions = document.createElement('div');
+        actions.className = 'sidebar-info-actions';
+        const exportBtn = document.createElement('button');
+        exportBtn.type = 'button';
+        exportBtn.className = 'sidebar-info-btn';
+        exportBtn.textContent = 'Export data';
+        exportBtn.addEventListener('click', () => this.userDataStore.downloadExport());
+        const importBtn = document.createElement('button');
+        importBtn.type = 'button';
+        importBtn.className = 'sidebar-info-btn';
+        importBtn.textContent = 'Import data';
+        actions.appendChild(exportBtn);
+        actions.appendChild(importBtn);
+        info.appendChild(actions);
+
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'application/json';
+        fileInput.addEventListener('change', async (event) => {
+            const files = event.target.files;
+            if (files && files[0]) {
+                try {
+                    this.userDataStore.importFromString(await files[0].text());
+                    alert('✅ User data imported. All likes, playlists, subscriptions, and history now match the file.');
+                } catch (error) {
+                    console.error('❌ Import failed:', error);
+                    alert('⚠️ Could not import that file. Please provide a newtube export JSON.');
+                }
+            }
+            event.target.value = '';
+        });
+        info.appendChild(fileInput);
+        importBtn.addEventListener('click', () => fileInput.click());
+
+        const statsBlock = document.createElement('div');
+        statsBlock.className = 'sidebar-info-stats';
+        [
+            ['Likes', stats.likes],
+            ['Dislikes', stats.dislikes],
+            ['Playlists', stats.playlists],
+            ['Subscriptions', stats.subscriptions],
+            ['Watched', stats.watched]
+        ].forEach(([label, value]) => {
+            const stat = document.createElement('span');
+            stat.textContent = `${label}: ${value}`;
+            statsBlock.appendChild(stat);
+        });
+        info.appendChild(statsBlock);
+
+        const tip = document.createElement('p');
+        tip.textContent =
+            'Tip: email the export file to yourself or store it in a password manager to keep devices in sync.';
+        info.appendChild(tip);
+
+        return info;
+    }
+
+    formatRelativeTime(timestamp) {
+        if (!timestamp) return 'just now';
+        const date = new Date(timestamp);
+        if (Number.isNaN(date.getTime())) return 'just now';
+        const diffMs = Date.now() - date.getTime();
+        if (diffMs < 0) return 'in the future';
+        const minutes = Math.floor(diffMs / (1000 * 60));
+        if (minutes < 1) return 'just now';
+        if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+        const days = Math.floor(hours / 24);
+        if (days < 7) return `${days} day${days === 1 ? '' : 's'} ago`;
+        const weeks = Math.floor(days / 7);
+        if (weeks < 5) return `${weeks} week${weeks === 1 ? '' : 's'} ago`;
+        const months = Math.floor(days / 30);
+        if (months < 12) return `${months} month${months === 1 ? '' : 's'} ago`;
+        const years = Math.floor(days / 365);
+        return `${years} year${years === 1 ? '' : 's'} ago`;
+    }
+
     destroy() {
         if (this.resizeHandler) {
             window.removeEventListener('resize', this.resizeHandler);
+        }
+        if (this.userDataListener) {
+            window.removeEventListener('newtube:userdata', this.userDataListener);
+            this.userDataListener = null;
         }
         this.chips.destroy();
         this.videoGrid.destroy();
@@ -805,11 +1140,14 @@ class HomePage {
         // Initialize components
         this.header = new Header(() => this.toggleSidebar());
         this.content = new MainContent();
-        this.sidebar = new Sidebar((state) => {
-            if (this.content) {
-                this.content.setSidebarState(state);
-            }
-        });
+        this.sidebar = new Sidebar(
+            (state) => {
+                if (this.content) {
+                    this.content.setSidebarState(state);
+                }
+            },
+            (key) => this.handleNavigation(key)
+        );
 
         const headerElement = this.header.init();
         const contentElement = this.content.init();
@@ -833,6 +1171,32 @@ class HomePage {
             this.content.setVideos(videos || []);
         } catch (error) {
             console.error('⚠️ Failed to refresh home videos:', error);
+        }
+    }
+
+    handleNavigation(target) {
+        const key = target || 'home';
+        if (this.sidebar) {
+            this.sidebar.setActiveItem(key);
+        }
+
+        if (!this.content) {
+            return;
+        }
+
+        switch (key) {
+            case 'history':
+                this.content.setView('history');
+                break;
+            case 'you':
+                this.content.setView('you');
+                break;
+            case 'subscriptions':
+                this.content.setView('subscriptions');
+                break;
+            default:
+                this.content.setView('home');
+                break;
         }
     }
 

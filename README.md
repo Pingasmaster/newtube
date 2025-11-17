@@ -20,7 +20,7 @@ The Javascript caches pages and loads them only one time via a service worker to
      --domain example.com \
      --trusted-pubkey release-public-key.json
    ```
-   The repository now ships `release-public-key.json`, so you no longer have to copy the verifier to every host. Add `--release-repo <owner/repo>` if you are tracking a fork instead of `Pingasmaster/newtube`.
+   The repository now ships `release-public-key.json`, so you no longer have to copy the verifier to every host. The installer copies that key into `<WWW_ROOT>/release-public-key.json` (derived from your config) and all services default to that location—`/etc/newtube-release.pub` is no longer used. Add `--release-repo <owner/repo>` if you are tracking a fork instead of `Pingasmaster/newtube`.
    (Fork maintainers: overwrite that file with your own Ed25519 public key before installing.)
 3. **Answer the prompts** (media root defaults to `/yt`, www root to `/www/newtube.com`, backend port `8080`). The installer writes everything to `/etc/newtube-env`, deploys nginx, copies the freshly built binaries to `/opt/newtube/bin`, and enables the systemd services (`newtube-backend`, `newtube-routine`, plus the nightly updater).
 
@@ -29,7 +29,7 @@ From that point on the machine keeps itself current: every night at 03:00 the up
 ## Automatic updates & signed releases
 
 - **Two release artifacts per tag.** GitHub Actions (see `.github/workflows/release.yml`) produces `newtube-src-<tag>.tar.gz` (full repo tree) and `newtube-bin-<tag>.tar.gz` (prebuilt binaries + static assets). Each archive ships with a `.sig` file containing a BLAKE3 digest and an Ed25519 signature.
-- **Only the signed source archive feeds automation.** `installer --auto-update` (and the nightly `software-updater.timer`) downloads the latest source tarball + signature from GitHub Releases, verifies them with `release-public-key.json`, rebuilds the binaries locally, replaces `/opt/newtube/bin`, refreshes the static assets, and restarts `newtube-backend` + `newtube-routine`. The binary tarball is there for reproducibility/mirrors but is never executed automatically.
+- **Only the signed source archive feeds automation.** `installer --auto-update` (and the nightly `software-updater.timer`) downloads the latest source tarball + signature from GitHub Releases, verifies them with `<WWW_ROOT>/release-public-key.json`, rebuilds the binaries locally, replaces `/opt/newtube/bin`, refreshes the static assets, and restarts `newtube-backend` + `newtube-routine`. The binary tarball is there for reproducibility/mirrors but is never executed automatically.
 - **Manual/offline updates** use the same verification flow. Download the source tarball and signature and run:
   ```bash
   sudo /opt/newtube/bin/installer \
@@ -115,7 +115,7 @@ Every Rust binary lives under `target/release/`. Unless you pass overrides, they
 
 ### `installer`
 
-- Purpose: one-stop setup/teardown tool that also enforces the signed-release workflow. It writes `/etc/newtube-env`, deploys nginx, copies binaries into `/opt/newtube/bin`, installs the systemd units (`newtube-backend`, `newtube-routine`, `software-updater.service/.timer`), and verifies every update using the public key embedded in `release-public-key.json`. Root is required for install/uninstall/reinstall (only `--cleanup` is non-root).
+- Purpose: one-stop setup/teardown tool that also enforces the signed-release workflow. It writes `/etc/newtube-env`, deploys nginx, copies binaries into `/opt/newtube/bin`, installs the systemd units (`newtube-backend`, `newtube-routine`, `software-updater.service/.timer`), and verifies every update using the public key at `<WWW_ROOT>/release-public-key.json`. Root is required for install/uninstall/reinstall (only `--cleanup` is non-root).
 - Behaviour:
   - Prompts for/creates the media root (stores downloads + metadata) and www root (served by nginx), rebuilds the project, and copies fresh binaries into `/opt/newtube/bin`.
   - Deploys a Let’s Encrypt-friendly nginx config for the supplied domain and reloads nginx automatically.

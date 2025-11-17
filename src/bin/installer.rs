@@ -29,7 +29,7 @@ use walkdir::WalkDir;
 const DEFAULT_MEDIA_DIR: &str = "/yt";
 const DEFAULT_WWW_DIR: &str = "/www/newtube.com";
 const BIN_ROOT: &str = "/opt/newtube/bin";
-const DEFAULT_PUBLIC_KEY_PATH: &str = "/etc/newtube-release.pub";
+const DEFAULT_PUBLIC_KEY_FILENAME: &str = "release-public-key.json";
 const RELEASE_SIG_VERSION: u32 = 1;
 const RELEASE_SIG_PREFIX: &str = "newtube-release";
 const SOURCE_ARCHIVE_PREFIX: &str = "newtube-src";
@@ -42,7 +42,7 @@ const SOFTWARE_TIMER: &str = "software-updater.timer";
 const NGINX_SERVICE: &str = "nginx";
 const BACKEND_SERVICE: &str = "newtube-backend.service";
 const ROUTINE_SERVICE: &str = "newtube-routine.service";
-const newtube_GROUP: &str = "newtube";
+const NEWTUBE_GROUP: &str = "newtube";
 const BACKEND_USER: &str = "newtube-backend";
 const DOWNLOADER_USER: &str = "newtube-downloader";
 const BACKEND_HOME: &str = "/var/lib/newtube-backend";
@@ -63,6 +63,22 @@ const FRONTEND_SKIP_ENTRIES: &[&str] = &[
     "README.md",
     "LICENSE",
 ];
+
+fn default_pubkey_path_for_www(www_root: &Path) -> PathBuf {
+    www_root.join(DEFAULT_PUBLIC_KEY_FILENAME)
+}
+
+fn default_pubkey_from_config(config_path: &Path) -> Result<PathBuf> {
+    let runtime = load_runtime_paths_from(config_path)?;
+    Ok(default_pubkey_path_for_www(&runtime.www_root))
+}
+
+fn resolve_runtime_pubkey_path(cli_value: &Option<PathBuf>, config_path: &Path) -> Result<PathBuf> {
+    if let Some(path) = cli_value.clone() {
+        return Ok(path);
+    }
+    default_pubkey_from_config(config_path)
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Install and manage newtube services.")]
@@ -206,8 +222,12 @@ struct Cli {
         help = "Directory where signing key files should be written"
     )]
     key_dir: Option<PathBuf>,
-    #[arg(long = "trusted-pubkey", value_name = "PATH", default_value = DEFAULT_PUBLIC_KEY_PATH, help = "Path to the trusted release public key used for verification")]
-    trusted_pubkey: PathBuf,
+    #[arg(
+        long = "trusted-pubkey",
+        value_name = "PATH",
+        help = "Path to the trusted release public key used for verification (defaults to <WWW_ROOT>/release-public-key.json)"
+    )]
+    trusted_pubkey: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -232,6 +252,7 @@ fn main() -> Result<()> {
     ensure_root()?;
 
     if cli.apply_archive {
+        let pubkey_path = resolve_runtime_pubkey_path(&cli.trusted_pubkey, &cli.config)?;
         apply_signed_source_archive(
             &cli.config,
             cli.source_archive
@@ -240,7 +261,7 @@ fn main() -> Result<()> {
             cli.source_signature
                 .as_ref()
                 .expect("source signature required"),
-            &cli.trusted_pubkey,
+            &pubkey_path,
             None,
         )?;
         return Ok(());
@@ -248,7 +269,8 @@ fn main() -> Result<()> {
 
     if cli.auto_update {
         let token = load_optional_token(cli.github_token_file.as_deref())?;
-        auto_update_from_github(&cli.config, &cli.trusted_pubkey, token.as_deref())?;
+        let pubkey_path = resolve_runtime_pubkey_path(&cli.trusted_pubkey, &cli.config)?;
+        auto_update_from_github(&cli.config, &pubkey_path, token.as_deref())?;
         return Ok(());
     }
 
@@ -331,6 +353,12 @@ fn main() -> Result<()> {
         )?)
     };
 
+    let pubkey_destination = default_pubkey_path_for_www(&www_root);
+    let pubkey_source = cli
+        .trusted_pubkey
+        .clone()
+        .unwrap_or_else(|| repo_root.join(DEFAULT_PUBLIC_KEY_FILENAME));
+
     if cli.reinstall {
         uninstall(&media_root, &cli.config)?;
         let install_config = InstallConfig {
@@ -343,8 +371,9 @@ fn main() -> Result<()> {
             app_version,
             release_repo: release_repo.clone(),
             assume_yes: cli.assume_yes,
+            pubkey_path: pubkey_destination.clone(),
         };
-        install(install_config, &repo_root, &cli.trusted_pubkey)?;
+        install(install_config, &repo_root, &pubkey_source)?;
         return Ok(());
     }
 
@@ -363,9 +392,10 @@ fn main() -> Result<()> {
         app_version,
         release_repo,
         assume_yes: cli.assume_yes,
+        pubkey_path: pubkey_destination,
     };
 
-    install(install_config, &repo_root, &cli.trusted_pubkey)
+    install(install_config, &repo_root, &pubkey_source)
 }
 
 #[derive(Clone, Debug)]
@@ -379,6 +409,7 @@ struct InstallConfig {
     app_version: String,
     release_repo: String,
     assume_yes: bool,
+    pubkey_path: PathBuf,
 }
 
 fn install(cfg: InstallConfig, repo_root: &Path, pubkey_source: &Path) -> Result<()> {
@@ -394,7 +425,7 @@ fn install(cfg: InstallConfig, repo_root: &Path, pubkey_source: &Path) -> Result
     deploy_nginx_config(&cfg.domain_name, &cfg.www_root, cfg.assume_yes)?;
 
     write_env_config(&cfg)?;
-    install_trusted_pubkey(pubkey_source)?;
+    install_trusted_pubkey(pubkey_source, &cfg.pubkey_path)?;
     install_systemd_units(&cfg)?;
     build_from_workspace(repo_root, &cfg)?;
 
@@ -462,10 +493,12 @@ fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn install_trusted_pubkey(source: &Path) -> Result<()> {
-    let dest = Path::new(DEFAULT_PUBLIC_KEY_PATH);
+fn install_trusted_pubkey(source: &Path, dest: &Path) -> Result<()> {
     if dest.exists() {
         return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
     }
     if !source.exists() {
         bail!(
@@ -513,7 +546,7 @@ fn copy_executable(src: &Path, dest: &Path) -> Result<()> {
     fs::copy(src, dest)
         .with_context(|| format!("Copying {} to {}", src.display(), dest.display()))?;
     fs::set_permissions(dest, fs::Permissions::from_mode(0o750))?;
-    chown_to("root", newtube_GROUP, dest)?;
+    chown_to("root", NEWTUBE_GROUP, dest)?;
     Ok(())
 }
 
@@ -530,6 +563,8 @@ fn chown_to(owner: &str, group: &str, path: &Path) -> Result<()> {
 }
 
 fn copy_frontend_assets(src_root: &Path, dest_root: &Path) -> Result<()> {
+    let preserved_key_path = dest_root.join(DEFAULT_PUBLIC_KEY_FILENAME);
+    let preserved_key = fs::read(&preserved_key_path).ok();
     if dest_root.exists() {
         fs::remove_dir_all(dest_root)
             .with_context(|| format!("Removing stale assets at {}", dest_root.display()))?;
@@ -551,6 +586,11 @@ fn copy_frontend_assets(src_root: &Path, dest_root: &Path) -> Result<()> {
         } else if file_type.is_file() {
             copy_file_with_mode(&entry.path(), &destination, 0o644)?;
         }
+    }
+    if let Some(bytes) = preserved_key {
+        fs::write(&preserved_key_path, bytes)
+            .with_context(|| format!("Restoring {}", preserved_key_path.display()))?;
+        fs::set_permissions(&preserved_key_path, fs::Permissions::from_mode(0o640))?;
     }
     Ok(())
 }
@@ -588,7 +628,7 @@ fn ensure_media_permissions(media_root: &Path) -> Result<()> {
     if !media_root.exists() {
         return Ok(());
     }
-    let owner = format!("{}:{}", DOWNLOADER_USER, newtube_GROUP);
+    let owner = format!("{}:{}", DOWNLOADER_USER, NEWTUBE_GROUP);
     let status = Command::new("chown")
         .arg("-R")
         .arg(&owner)
@@ -667,7 +707,7 @@ fn write_env_config(cfg: &InstallConfig) -> Result<()> {
     fs::write(&cfg.config_path, content)
         .with_context(|| format!("Writing {}", cfg.config_path.display()))?;
     fs::set_permissions(&cfg.config_path, fs::Permissions::from_mode(0o640))?;
-    let owner = format!("root:{}", newtube_GROUP);
+    let owner = format!("root:{}", NEWTUBE_GROUP);
     let target = cfg.config_path.to_string_lossy().into_owned();
     let args = [owner.as_str(), target.as_str()];
     run_command("chown", &args)?;
@@ -675,13 +715,15 @@ fn write_env_config(cfg: &InstallConfig) -> Result<()> {
 }
 
 fn env_to_install_config(env: EnvConfig, config_path: PathBuf) -> Result<InstallConfig> {
+    let media_root = env
+        .media_root
+        .ok_or_else(|| anyhow!("MEDIA_ROOT missing from {}", config_path.display()))?;
+    let www_root = env
+        .www_root
+        .ok_or_else(|| anyhow!("WWW_ROOT missing from {}", config_path.display()))?;
     Ok(InstallConfig {
-        media_root: env
-            .media_root
-            .ok_or_else(|| anyhow!("MEDIA_ROOT missing from {}", config_path.display()))?,
-        www_root: env
-            .www_root
-            .ok_or_else(|| anyhow!("WWW_ROOT missing from {}", config_path.display()))?,
+        media_root: media_root.clone(),
+        www_root: www_root.clone(),
         newtube_port: env.newtube_port.unwrap_or(DEFAULT_NEWTUBE_PORT),
         newtube_host: env
             .newtube_host
@@ -695,6 +737,7 @@ fn env_to_install_config(env: EnvConfig, config_path: PathBuf) -> Result<Install
             .release_repo
             .unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string()),
         assume_yes: true,
+        pubkey_path: default_pubkey_path_for_www(&www_root),
     })
 }
 
@@ -1074,9 +1117,9 @@ fn ensure_nginx_installed(assume_yes: bool) -> Result<()> {
 }
 
 fn ensure_service_accounts(cfg: &InstallConfig) -> Result<()> {
-    ensure_group_exists(newtube_GROUP)?;
-    ensure_user_exists(BACKEND_USER, newtube_GROUP, BACKEND_HOME)?;
-    ensure_user_exists(DOWNLOADER_USER, newtube_GROUP, DOWNLOADER_HOME)?;
+    ensure_group_exists(NEWTUBE_GROUP)?;
+    ensure_user_exists(BACKEND_USER, NEWTUBE_GROUP, BACKEND_HOME)?;
+    ensure_user_exists(DOWNLOADER_USER, NEWTUBE_GROUP, DOWNLOADER_HOME)?;
     ensure_media_permissions(&cfg.media_root)?;
     Ok(())
 }
@@ -1223,7 +1266,7 @@ fn install_systemd_units(cfg: &InstallConfig) -> Result<()> {
     let routine_service = systemd_dir.join(ROUTINE_SERVICE);
 
     let installer_exec = escape_systemd_path(&Path::new(BIN_ROOT).join("installer"))?;
-    let pubkey_path = escape_systemd_path(Path::new(DEFAULT_PUBLIC_KEY_PATH))?;
+    let pubkey_path = escape_systemd_path(&cfg.pubkey_path)?;
     let config_path = escape_systemd_path(&cfg.config_path)?;
     let updater_contents = format!(
         "[Unit]\nDescription=Fetch and build signed newtube releases\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nWorkingDirectory=/\nExecStart={exec} --auto-update --config {config} --trusted-pubkey {pubkey}\nTimeoutStartSec=3600\n\n[Install]\nWantedBy=multi-user.target\n",
@@ -1241,7 +1284,7 @@ fn install_systemd_units(cfg: &InstallConfig) -> Result<()> {
     let backend_contents = format!(
         "[Unit]\nDescription=newtube backend API\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nUser={user}\nGroup={group}\nWorkingDirectory={work}\nExecStart={exec} --config {config}\nRestart=on-failure\nRestartSec=2\nAmbientCapabilities=\nCapabilityBoundingSet=\nNoNewPrivileges=yes\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=yes\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nUMask=0027\nReadWritePaths={work}\n\n[Install]\nWantedBy=multi-user.target\n",
         user = BACKEND_USER,
-        group = newtube_GROUP,
+        group = NEWTUBE_GROUP,
         work = media_work_dir,
         exec = backend_exec,
         config = config_path
@@ -1253,7 +1296,7 @@ fn install_systemd_units(cfg: &InstallConfig) -> Result<()> {
     let routine_contents = format!(
         "[Unit]\nDescription=newtube nightly channel refresh\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser={user}\nGroup={group}\nWorkingDirectory={work}\nExecStart={exec} --config {config} --media-root {work} --www-root {www}\nAmbientCapabilities=\nCapabilityBoundingSet=\nNoNewPrivileges=yes\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=yes\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nUMask=0027\nReadWritePaths={work}\n\n[Install]\nWantedBy=multi-user.target\n",
         user = DOWNLOADER_USER,
-        group = newtube_GROUP,
+        group = NEWTUBE_GROUP,
         work = media_work_dir,
         exec = routine_exec,
         config = config_path,

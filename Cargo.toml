@@ -22,7 +22,7 @@ tempfile = "3.23.0"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 blake3 = "1.5.1"
-ureq = { version = "2.10.1", features = ["json"] }
+ureq = { version = "3.1.4", features = ["json"] }
 xz2 = "0.1.7"
 tar = "0.4.41"
 base64 = "0.22.1"

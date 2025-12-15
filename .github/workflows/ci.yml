@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload Jest coverage
         if: steps.jest_coverage.outcome == 'success'
-        uses: actions/upload-artifact@v5.0.0
+        uses: actions/upload-artifact@v6.0.0
         with:
           name: coverage-jest
           path: coverage/jest

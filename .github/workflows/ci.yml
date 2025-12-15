@@ -22,7 +22,7 @@ jobs:
           rustup override set stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4.3.0
+        uses: actions/cache@v5.0.1
         with:
           path: |
             ~/.cargo/registry

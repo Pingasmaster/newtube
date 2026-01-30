@@ -1,0 +1,33 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./data/media:/data/media
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+
+  routine_update:
+    build: .
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    volumes:
+      - ./data/media:/data/media
+      - ./.env:/app/.env:ro
+    command: ["sh", "-c", "while true; do routine_update; sleep 24h; done"]
+    restart: unless-stopped
+
+  downloader:
+    build: .
+    profiles: ["manual"]
+    env_file:
+      - .env
+    volumes:
+      - ./data/media:/data/media
+      - ./.env:/app/.env:ro
+    entrypoint: ["download_channel"]

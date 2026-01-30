@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use newtube_tools::{
-    config::{DEFAULT_CONFIG_PATH, load_runtime_paths_from},
+    config::load_runtime_paths,
     metadata::MetadataStore,
     security::ensure_not_root,
 };
@@ -28,7 +28,6 @@ const METADATA_DB_FILE: &str = "metadata.db";
 struct RoutineArgs {
     media_root: PathBuf,
     www_root: PathBuf,
-    config_path: PathBuf,
 }
 
 impl RoutineArgs {
@@ -47,7 +46,6 @@ impl RoutineArgs {
     {
         let mut media_root_override: Option<PathBuf> = None;
         let mut www_root_override: Option<PathBuf> = None;
-        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut args = iter.into_iter();
 
         while let Some(arg) = args.next() {
@@ -57,10 +55,6 @@ impl RoutineArgs {
             }
             if let Some(value) = arg.strip_prefix("--www-root=") {
                 www_root_override = Some(PathBuf::from(value));
-                continue;
-            }
-            if let Some(value) = arg.strip_prefix("--config=") {
-                config_path = PathBuf::from(value);
                 continue;
             }
 
@@ -77,26 +71,19 @@ impl RoutineArgs {
                         .ok_or_else(|| anyhow::anyhow!("--www-root requires a value"))?;
                     www_root_override = Some(PathBuf::from(value));
                 }
-                "--config" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a value"))?;
-                    config_path = PathBuf::from(value);
-                }
                 _ => {
                     bail!("unknown argument: {arg}");
                 }
             }
         }
 
-        let runtime_paths = load_runtime_paths_from(&config_path)?;
+        let runtime_paths = load_runtime_paths()?;
         let media_root = media_root_override.unwrap_or(runtime_paths.media_root);
         let www_root = www_root_override.unwrap_or(runtime_paths.www_root);
 
         Ok(Self {
             media_root,
             www_root,
-            config_path,
         })
     }
 }
@@ -110,18 +97,20 @@ struct MinimalInfo {
 
 /// Scans on-disk metadata, identifies unique channels, and launches
 /// `download_channel` for each.
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     ensure_not_root("routine_update")?;
 
     let RoutineArgs {
         media_root,
         www_root,
-        config_path,
     } = RoutineArgs::parse()?;
 
     let metadata_path = media_root.join(METADATA_DB_FILE);
     let _metadata =
-        MetadataStore::open(&metadata_path).context("initializing metadata database")?;
+        MetadataStore::open(&metadata_path)
+            .await
+            .context("initializing metadata database")?;
 
     println!("Library root: {}", media_root.display());
     println!("WWW root: {}", www_root.display());
@@ -162,8 +151,6 @@ fn main() -> Result<()> {
         );
 
         match Command::new(&downloader)
-            .arg("--config")
-            .arg(&config_path)
             .arg("--media-root")
             .arg(&media_root)
             .arg("--www-root")
@@ -297,43 +284,69 @@ fn find_download_channel_executable() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::io::Write;
     use std::{
         fs::{self, File},
         path::PathBuf,
     };
-    use tempfile::{NamedTempFile, tempdir};
+    use std::sync::Mutex;
+    use tempfile::tempdir;
 
-    fn write_runtime_config(media: &str, www: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nNEWTUBE_HOST=\"127.0.0.1\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
-        )
-        .unwrap();
-        file
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_file(vars: &[(&str, &str)], f: impl FnOnce()) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let mut contents = String::new();
+        for (key, value) in vars {
+            contents.push_str(&format!("{key}=\"{value}\"\n"));
+        }
+        fs::write(dir.path().join(".env"), contents).unwrap();
+        let cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        f();
+        env::set_current_dir(cwd).unwrap();
     }
 
     #[test]
     fn routine_args_default_paths() {
-        let config = write_runtime_config("/yt", "/www/newtube.com");
-        let args = RoutineArgs::from_slice(&["--config", config.path().to_str().unwrap()]).unwrap();
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", "/yt"),
+                ("WWW_ROOT", "/www/newtube.com"),
+            ],
+            || {
+                parsed = Some(RoutineArgs::from_slice(&[]).unwrap());
+            },
+        );
+        let args = parsed.unwrap();
         assert_eq!(args.media_root, PathBuf::from("/yt"));
         assert_eq!(args.www_root, PathBuf::from("/www/newtube.com"));
     }
 
     #[test]
     fn routine_args_override_paths() {
-        let config = write_runtime_config("/yt", "/www/newtube.com");
-        let args = RoutineArgs::from_slice(&[
-            "--config",
-            config.path().to_str().unwrap(),
-            "--media-root",
-            "/data/yt",
-            "--www-root",
-            "/srv/site",
-        ])
-        .unwrap();
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", "/yt"),
+                ("WWW_ROOT", "/www/newtube.com"),
+            ],
+            || {
+                parsed = Some(
+                    RoutineArgs::from_slice(&[
+                        "--media-root",
+                        "/data/yt",
+                        "--www-root",
+                        "/srv/site",
+                    ])
+                    .unwrap(),
+                );
+            },
+        );
+        let args = parsed.unwrap();
         assert_eq!(args.media_root, PathBuf::from("/data/yt"));
         assert_eq!(args.www_root, PathBuf::from("/srv/site"));
     }

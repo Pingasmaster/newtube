@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, Utc};
-use newtube_tools::config::{DEFAULT_CONFIG_PATH, load_runtime_paths_from};
+use newtube_tools::config::load_runtime_paths;
 use newtube_tools::metadata::{
     CommentRecord, MetadataStore, SubtitleCollection, SubtitleTrack, VideoRecord, VideoSource,
 };
@@ -113,7 +113,6 @@ impl DownloaderArgs {
     {
         let mut media_root_override: Option<PathBuf> = None;
         let mut www_root_override: Option<PathBuf> = None;
-        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut channel_url: Option<String> = None;
         let mut args = iter.into_iter();
 
@@ -133,10 +132,6 @@ impl DownloaderArgs {
                 www_root_override = Some(PathBuf::from(value));
                 continue;
             }
-            if let Some(value) = arg.strip_prefix("--config=") {
-                config_path = PathBuf::from(value);
-                continue;
-            }
 
             match arg.as_str() {
                 "--media-root" => {
@@ -151,12 +146,6 @@ impl DownloaderArgs {
                         .ok_or_else(|| anyhow::anyhow!("--www-root requires a value"))?;
                     www_root_override = Some(PathBuf::from(value));
                 }
-                "--config" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a value"))?;
-                    config_path = PathBuf::from(value);
-                }
                 _ if arg.starts_with('-') => {
                     bail!("unknown argument: {arg}");
                 }
@@ -168,11 +157,11 @@ impl DownloaderArgs {
 
         let channel_url = channel_url.ok_or_else(|| {
             anyhow::anyhow!(
-                "Usage: download_channel [--config <path>] [--media-root <path>] [--www-root <path>] <channel_url>"
+                "Usage: download_channel [--media-root <path>] [--www-root <path>] <channel_url>"
             )
         })?;
 
-        let runtime_paths = load_runtime_paths_from(&config_path)?;
+        let runtime_paths = load_runtime_paths()?;
         let media_root = media_root_override.unwrap_or_else(|| runtime_paths.media_root.clone());
         let www_root = www_root_override.unwrap_or_else(|| runtime_paths.www_root.clone());
 
@@ -293,7 +282,8 @@ enum MediaKind {
 
 /// CLI entry point. Validates prerequisites, prepares directories, and kicks
 /// off downloads for both standard uploads and Shorts.
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     ensure_not_root("download_channel")?;
 
     let DownloaderArgs {
@@ -306,8 +296,10 @@ fn main() -> Result<()> {
 
     let paths = Paths::with_roots(&media_root, &www_root);
     paths.prepare()?;
-    let mut metadata =
-        MetadataStore::open(&paths.metadata_db).context("initializing metadata database")?;
+    let metadata =
+        MetadataStore::open(&paths.metadata_db)
+            .await
+            .context("initializing metadata database")?;
 
     println!("===================================");
     println!("YouTube Channel Downloader");
@@ -329,8 +321,9 @@ fn main() -> Result<()> {
         &paths,
         &mut archive,
         MediaKind::Video,
-        &mut metadata,
-    )?;
+        &metadata,
+    )
+    .await?;
 
     download_collection(
         "shorts",
@@ -339,8 +332,9 @@ fn main() -> Result<()> {
         &paths,
         &mut archive,
         MediaKind::Short,
-        &mut metadata,
-    )?;
+        &metadata,
+    )
+    .await?;
 
     println!();
     println!("===================================");
@@ -480,14 +474,14 @@ fn append_to_archive(path: &Path, video_id: &str) -> Result<()> {
 
 /// Given a playlist (videos, Shorts, etc.), download each entry and refresh its
 /// metadata.
-fn download_collection(
+async fn download_collection(
     label: &str,
     list_url: String,
     filter: Option<&str>,
     paths: &Paths,
     archive: &mut HashSet<String>,
     media_kind: MediaKind,
-    metadata: &mut MetadataStore,
+    metadata: &MetadataStore,
 ) -> Result<()> {
     println!("Getting list of {}...", label);
 
@@ -507,7 +501,9 @@ fn download_collection(
         let current = index + 1;
         if let Err(err) = process_media_entry(
             video_id, current, total, paths, archive, media_kind, metadata,
-        ) {
+        )
+        .await
+        {
             eprintln!("  Warning: failed to process {}: {}", video_id, err);
         }
     }
@@ -528,14 +524,14 @@ fn download_collection(
 
 /// Handles a single video/short: download media if missing, then refresh all
 /// metadata artifacts.
-fn process_media_entry(
+async fn process_media_entry(
     video_id: &str,
     current: usize,
     total: usize,
     paths: &Paths,
     archive: &mut HashSet<String>,
     media_kind: MediaKind,
-    metadata: &mut MetadataStore,
+    metadata: &MetadataStore,
 ) -> Result<()> {
     let output_dir = paths.media_dir(media_kind);
     // Archive entries let us skip heavy downloads when the file tree already
@@ -564,7 +560,9 @@ fn process_media_entry(
 
     if let Err(err) = refresh_metadata(
         video_id, &video_url, output_dir, paths, media_kind, metadata,
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "  Warning: metadata refresh failed for {}: {}",
             video_id, err
@@ -575,27 +573,27 @@ fn process_media_entry(
 }
 
 /// Fetches info JSON, updates DB rows, and syncs subtitles/comments.
-fn refresh_metadata(
+async fn refresh_metadata(
     video_id: &str,
     video_url: &str,
     output_dir: &Path,
     paths: &Paths,
     media_kind: MediaKind,
-    metadata: &mut MetadataStore,
+    metadata: &MetadataStore,
 ) -> Result<()> {
     let info = fetch_video_info(video_id, video_url, output_dir, paths)?;
     let record = build_video_record(video_id, &info, output_dir, media_kind, paths)?;
 
     match media_kind {
-        MediaKind::Video => metadata.upsert_video(&record)?,
-        MediaKind::Short => metadata.upsert_short(&record)?,
+        MediaKind::Video => metadata.upsert_video(&record).await?,
+        MediaKind::Short => metadata.upsert_short(&record).await?,
     }
 
     let subtitles = collect_subtitles(video_id, &info, paths, media_kind)?;
-    metadata.upsert_subtitles(&subtitles)?;
+    metadata.upsert_subtitles(&subtitles).await?;
 
     let comments = fetch_comments(video_id, video_url, paths)?;
-    metadata.replace_comments(video_id, &comments)?;
+    metadata.replace_comments(video_id, &comments).await?;
 
     Ok(())
 }
@@ -1399,17 +1397,24 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{fs, io::Write, path::PathBuf};
-    use tempfile::{NamedTempFile, tempdir};
+    use std::{env, fs, path::PathBuf};
+    use std::sync::Mutex;
+    use tempfile::tempdir;
 
-    fn write_runtime_config(media: &str, www: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"8080\"\nNEWTUBE_HOST=\"127.0.0.1\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
-        )
-        .unwrap();
-        file
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_file(vars: &[(&str, &str)], f: impl FnOnce()) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let mut contents = String::new();
+        for (key, value) in vars {
+            contents.push_str(&format!("{key}=\"{value}\"\n"));
+        }
+        fs::write(dir.path().join(".env"), contents).unwrap();
+        let cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        f();
+        env::set_current_dir(cwd).unwrap();
     }
 
     fn temp_paths() -> (tempfile::TempDir, Paths) {
@@ -1420,13 +1425,19 @@ mod tests {
 
     #[test]
     fn downloader_args_use_defaults() {
-        let config = write_runtime_config(DEFAULT_MEDIA_ROOT, DEFAULT_WWW_ROOT);
-        let args = DownloaderArgs::from_slice(&[
-            "--config",
-            config.path().to_str().unwrap(),
-            "https://www.youtube.com/@Channel",
-        ])
-        .unwrap();
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", DEFAULT_MEDIA_ROOT),
+                ("WWW_ROOT", DEFAULT_WWW_ROOT),
+            ],
+            || {
+                parsed = Some(
+                    DownloaderArgs::from_slice(&["https://www.youtube.com/@Channel"]).unwrap(),
+                );
+            },
+        );
+        let args = parsed.unwrap();
         assert_eq!(args.channel_url, "https://www.youtube.com/@Channel");
         assert_eq!(args.media_root, PathBuf::from(DEFAULT_MEDIA_ROOT));
         assert_eq!(args.www_root, PathBuf::from(DEFAULT_WWW_ROOT));
@@ -1434,17 +1445,26 @@ mod tests {
 
     #[test]
     fn downloader_args_override_roots() {
-        let config = write_runtime_config(DEFAULT_MEDIA_ROOT, DEFAULT_WWW_ROOT);
-        let args = DownloaderArgs::from_slice(&[
-            "--config",
-            config.path().to_str().unwrap(),
-            "--media-root",
-            "/data/media",
-            "--www-root",
-            "/srv/www",
-            "https://www.youtube.com/@Channel",
-        ])
-        .unwrap();
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", DEFAULT_MEDIA_ROOT),
+                ("WWW_ROOT", DEFAULT_WWW_ROOT),
+            ],
+            || {
+                parsed = Some(
+                    DownloaderArgs::from_slice(&[
+                        "--media-root",
+                        "/data/media",
+                        "--www-root",
+                        "/srv/www",
+                        "https://www.youtube.com/@Channel",
+                    ])
+                    .unwrap(),
+                );
+            },
+        );
+        let args = parsed.unwrap();
 
         assert_eq!(args.media_root, PathBuf::from("/data/media"));
         assert_eq!(args.www_root, PathBuf::from("/srv/www"));
@@ -1841,8 +1861,8 @@ exit 0
         assert_eq!(sanitize_format_id("abc def"), "abc_def");
     }
 
-    #[test]
-    fn process_entry_refreshes_metadata_even_when_archived() -> Result<()> {
+    #[tokio::test]
+    async fn process_entry_refreshes_metadata_even_when_archived() -> Result<()> {
         let (temp, paths) = temp_paths();
         let stub = install_ytdlp_stub(temp.path())?;
         let _guard = set_ytdlp_stub_path(stub);
@@ -1855,7 +1875,7 @@ exit 0
         fs::create_dir_all(&subtitle_dir)?;
         fs::write(subtitle_dir.join("alpha.en.vtt"), "WEBVTT")?;
 
-        let mut metadata = MetadataStore::open(&paths.metadata_db)?;
+        let metadata = MetadataStore::open(&paths.metadata_db).await?;
         let mut archive = HashSet::from([String::from("alpha")]);
         process_media_entry(
             "alpha",
@@ -1864,13 +1884,14 @@ exit 0
             &paths,
             &mut archive,
             MediaKind::Video,
-            &mut metadata,
-        )?;
+            &metadata,
+        )
+        .await?;
 
-        let reader = MetadataReader::new(&paths.metadata_db)?;
-        let video = reader.get_video("alpha")?.expect("video stored");
+        let reader = MetadataReader::new(&paths.metadata_db).await?;
+        let video = reader.get_video("alpha").await?.expect("video stored");
         assert_eq!(video.title, "Alpha Title");
-        let comments = reader.get_comments("alpha")?;
+        let comments = reader.get_comments("alpha").await?;
         assert_eq!(comments.len(), 2);
         assert!(comments.iter().any(|c| c.status_likedbycreator));
         Ok(())
@@ -1894,13 +1915,13 @@ exit 0
         Ok(())
     }
 
-    #[test]
-    fn download_collection_downloads_new_entries() -> Result<()> {
+    #[tokio::test]
+    async fn download_collection_downloads_new_entries() -> Result<()> {
         let (temp, paths) = temp_paths();
         let stub = install_ytdlp_stub(temp.path())?;
         let _guard = set_ytdlp_stub_path(stub);
         paths.prepare()?;
-        let mut metadata = MetadataStore::open(&paths.metadata_db)?;
+        let metadata = MetadataStore::open(&paths.metadata_db).await?;
         let mut archive = HashSet::new();
         download_collection(
             "test videos",
@@ -1909,10 +1930,11 @@ exit 0
             &paths,
             &mut archive,
             MediaKind::Video,
-            &mut metadata,
-        )?;
-        let reader = MetadataReader::new(&paths.metadata_db)?;
-        assert!(reader.get_video("alpha")?.is_some());
+            &metadata,
+        )
+        .await?;
+        let reader = MetadataReader::new(&paths.metadata_db).await?;
+        assert!(reader.get_video("alpha").await?.is_some());
         let media_file = paths
             .media_dir(MediaKind::Video)
             .join("alpha")

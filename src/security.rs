@@ -5,13 +5,12 @@
 use anyhow::{Result, bail};
 use nix::unistd::Uid;
 
-/// Fails fast when a binary is started as root. All services are expected to
-/// run under the dedicated, unprivileged accounts provisioned by the
-/// installer. Guarding binaries themselves ensures that manual invocations do
-/// not silently revert to insecure defaults.
+/// Fails fast when a binary is started as root. Running as a regular
+/// unprivileged user keeps local installs predictable and avoids accidental
+/// writes into system directories.
 pub fn ensure_not_root(process: &str) -> Result<()> {
     if Uid::current().is_root() {
-        bail!("{process} must not be run as root; please use the newtube-* service accounts");
+        bail!("{process} must not be run as root; use a regular user or a dedicated service account");
     }
     Ok(())
 }

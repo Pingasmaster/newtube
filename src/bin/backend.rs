@@ -18,12 +18,12 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use mime_guess::{MimeGuess, mime::Mime};
-use newtube_tools::config::{DEFAULT_CONFIG_PATH, load_runtime_paths_from};
+use newtube_tools::config::load_runtime_paths;
 use newtube_tools::metadata::{
     CommentRecord, MetadataReader, SubtitleCollection, VideoRecord, VideoSource,
 };
@@ -31,12 +31,10 @@ use newtube_tools::metadata::{
 use newtube_tools::metadata::{MetadataStore, SubtitleTrack};
 use newtube_tools::security::ensure_not_root;
 use parking_lot::RwLock;
-#[cfg(test)]
-use rusqlite::Connection;
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
-use tokio::{fs::File, signal, task};
+use tokio::{fs::File, signal};
 use tokio_util::io::ReaderStream;
 
 // Directory layout defaults. Keeping them centralized means the same values
@@ -52,6 +50,7 @@ const METADATA_DB_FILE: &str = "metadata.db";
 #[derive(Debug, Clone)]
 struct BackendArgs {
     media_root: PathBuf,
+    www_root: PathBuf,
     newtube_port: u16,
     listen_host: IpAddr,
 }
@@ -66,13 +65,17 @@ impl BackendArgs {
         I: IntoIterator<Item = String>,
     {
         let mut media_root_override: Option<PathBuf> = None;
+        let mut www_root_override: Option<PathBuf> = None;
         let mut port_override: Option<u16> = None;
         let mut host_override: Option<IpAddr> = None;
-        let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         let mut args = iter.into_iter();
         while let Some(arg) = args.next() {
             if let Some(value) = arg.strip_prefix("--media-root=") {
                 media_root_override = Some(PathBuf::from(value));
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--www-root=") {
+                www_root_override = Some(PathBuf::from(value));
                 continue;
             }
             if let Some(value) = arg.strip_prefix("--port=") {
@@ -83,10 +86,6 @@ impl BackendArgs {
                 host_override = Some(parse_host_arg(value)?);
                 continue;
             }
-            if let Some(value) = arg.strip_prefix("--config=") {
-                config_path = PathBuf::from(value);
-                continue;
-            }
 
             match arg.as_str() {
                 "--media-root" => {
@@ -94,6 +93,12 @@ impl BackendArgs {
                         .next()
                         .ok_or_else(|| anyhow!("--media-root requires a value"))?;
                     media_root_override = Some(PathBuf::from(value));
+                }
+                "--www-root" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--www-root requires a value"))?;
+                    www_root_override = Some(PathBuf::from(value));
                 }
                 "--port" => {
                     let value = args
@@ -107,24 +112,20 @@ impl BackendArgs {
                         .ok_or_else(|| anyhow!("--host requires a value"))?;
                     host_override = Some(parse_host_arg(&value)?);
                 }
-                "--config" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--config requires a value"))?;
-                    config_path = PathBuf::from(value);
-                }
                 _ => return Err(anyhow!("unknown argument: {arg}")),
             }
         }
 
-        let runtime_paths = load_runtime_paths_from(&config_path)?;
+        let runtime_paths = load_runtime_paths()?;
         let runtime_host = parse_host_arg(&runtime_paths.newtube_host)?;
         let media_root = media_root_override.unwrap_or(runtime_paths.media_root);
+        let www_root = www_root_override.unwrap_or(runtime_paths.www_root);
         let newtube_port = port_override.unwrap_or(runtime_paths.newtube_port);
         let listen_host = host_override.unwrap_or(runtime_host);
 
         Ok(Self {
             media_root,
+            www_root,
             newtube_port,
             listen_host,
         })
@@ -160,6 +161,7 @@ struct AppState {
     reader: Arc<MetadataReader>,
     cache: Arc<ApiCache>,
     files: Arc<FilePaths>,
+    www_root: Arc<PathBuf>,
 }
 
 /// Very small in-memory cache to avoid re-querying SQLite on every request.
@@ -287,6 +289,7 @@ type ApiResult<T> = Result<T, ApiError>;
 async fn main() -> Result<()> {
     let BackendArgs {
         media_root,
+        www_root,
         newtube_port,
         listen_host,
     } = BackendArgs::parse()?;
@@ -306,12 +309,15 @@ async fn main() -> Result<()> {
     };
 
     let metadata_path = media_root.join(METADATA_DB_FILE);
-    let reader = MetadataReader::new(&metadata_path).context("initializing metadata reader")?;
+    let reader = MetadataReader::new(&metadata_path)
+        .await
+        .context("initializing metadata reader")?;
 
     let state = AppState {
         reader: Arc::new(reader),
         cache: Arc::new(ApiCache::new()),
         files: Arc::new(FilePaths::new(&media_root)),
+        www_root: Arc::new(www_root),
     };
 
     // Each route is extremely small; helpers supplement anything that is shared
@@ -344,6 +350,7 @@ async fn main() -> Result<()> {
             get(download_short_thumbnail),
         )
         .route("/api/shorts/{id}/streams/{format}", get(stream_short_file))
+        .fallback(static_fallback)
         .with_state(state);
 
     let addr = SocketAddr::new(host, port);
@@ -366,6 +373,45 @@ async fn shutdown_signal() {
     if let Err(err) = signal::ctrl_c().await {
         eprintln!("Failed to install Ctrl+C handler: {}", err);
     }
+}
+
+async fn static_fallback(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let path = req.uri().path();
+    if path == "/api" || path.starts_with("/api/") {
+        return ApiError::not_found("endpoint not found").into_response();
+    }
+
+    match serve_www_path(&state.www_root, path).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn serve_www_path(root: &Path, request_path: &str) -> ApiResult<Response> {
+    let mut target = resolve_www_path(root, request_path)?;
+    let is_dir = tokio::fs::metadata(&target)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(true);
+    if is_dir {
+        target = root.join("index.html");
+    }
+    stream_file(target, None).await
+}
+
+fn resolve_www_path(root: &Path, request_path: &str) -> ApiResult<PathBuf> {
+    let trimmed = request_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Ok(root.join("index.html"));
+    }
+    let candidate = Path::new(trimmed);
+    if candidate
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiError::not_found("file not found"));
+    }
+    Ok(root.join(candidate))
 }
 
 async fn bootstrap(State(state): State<AppState>) -> ApiResult<Json<BootstrapPayload>> {
@@ -585,22 +631,32 @@ impl AppState {
             return Ok(cached);
         }
 
-        let reader = self.reader.clone();
-        let payload = task::spawn_blocking(move || -> Result<BootstrapPayload> {
-            let videos = reader.list_videos()?;
-            let shorts = reader.list_shorts()?;
-            let subtitles = reader.list_subtitles()?;
-            let comments = reader.list_all_comments()?;
-            Ok(BootstrapPayload {
-                videos: sanitize_video_records(&videos),
-                shorts: sanitize_video_records(&shorts),
-                subtitles,
-                comments,
-            })
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("task join error: {err}")))?
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        let videos = self
+            .reader
+            .list_videos()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        let shorts = self
+            .reader
+            .list_shorts()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        let subtitles = self
+            .reader
+            .list_subtitles()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        let comments = self
+            .reader
+            .list_all_comments()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        let payload = BootstrapPayload {
+            videos: sanitize_video_records(&videos),
+            shorts: sanitize_video_records(&shorts),
+            subtitles,
+            comments,
+        };
 
         let payload = Arc::new(payload);
         self.cache.bootstrap.write().replace(payload.clone());
@@ -614,14 +670,18 @@ impl AppState {
             return Ok(cached);
         }
 
-        let reader = self.reader.clone();
-        let records = task::spawn_blocking(move || match category {
-            MediaCategory::Video => reader.list_videos(),
-            MediaCategory::Short => reader.list_shorts(),
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("task join error: {err}")))?
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        let records = match category {
+            MediaCategory::Video => self
+                .reader
+                .list_videos()
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?,
+            MediaCategory::Short => self
+                .reader
+                .list_shorts()
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?,
+        };
 
         self.cache
             .media_list(category)
@@ -649,17 +709,18 @@ impl AppState {
             return Ok(record);
         }
 
-        let reader = self.reader.clone();
-        let result = task::spawn_blocking({
-            let videoid = videoid.to_owned();
-            move || match category {
-                MediaCategory::Video => reader.get_video(&videoid),
-                MediaCategory::Short => reader.get_short(&videoid),
-            }
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("task join error: {err}")))?
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        let result = match category {
+            MediaCategory::Video => self
+                .reader
+                .get_video(videoid)
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?,
+            MediaCategory::Short => self
+                .reader
+                .get_short(videoid)
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?,
+        };
 
         let record = result.ok_or_else(|| ApiError::not_found("video not found"))?;
 
@@ -678,14 +739,11 @@ impl AppState {
             return Ok(cached);
         }
 
-        let reader = self.reader.clone();
-        let comments = task::spawn_blocking({
-            let videoid = videoid.to_owned();
-            move || reader.get_comments(&videoid)
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("task join error: {err}")))?
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        let comments = self
+            .reader
+            .get_comments(videoid)
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
 
         self.cache
             .comments
@@ -702,14 +760,11 @@ impl AppState {
             return Ok(Some(cached));
         }
 
-        let reader = self.reader.clone();
-        let result = task::spawn_blocking({
-            let videoid = videoid.to_owned();
-            move || reader.get_subtitles(&videoid)
-        })
-        .await
-        .map_err(|err| ApiError::internal(format!("task join error: {err}")))?
-        .map_err(|err| ApiError::internal(err.to_string()))?;
+        let result = self
+            .reader
+            .get_subtitles(videoid)
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
 
         if let Some(collection) = &result {
             self.cache
@@ -779,9 +834,11 @@ fn sanitize_video_record(record: &VideoRecord) -> VideoRecord {
 mod tests {
     use super::*;
     use axum::{body::to_bytes, extract::State as AxumState};
+    use libsql::{Builder, params};
     use serde_json::Value;
-    use std::{io::Write, path::PathBuf, sync::Arc};
-    use tempfile::{NamedTempFile, tempdir};
+    use std::{env, path::PathBuf, sync::Arc};
+    use std::sync::Mutex;
+    use tempfile::tempdir;
 
     struct BackendTestContext {
         _temp: tempfile::TempDir,
@@ -790,19 +847,38 @@ mod tests {
         state: AppState,
     }
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_file(vars: &[(&str, &str)], f: impl FnOnce()) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let mut contents = String::new();
+        for (key, value) in vars {
+            contents.push_str(&format!("{key}=\"{value}\"\n"));
+        }
+        std::fs::write(dir.path().join(".env"), contents).unwrap();
+        let cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        f();
+        env::set_current_dir(cwd).unwrap();
+    }
+
     impl BackendTestContext {
-        fn new() -> Self {
+        async fn new() -> Self {
             let temp = tempdir().unwrap();
             let db_path = temp.path().join("metadata.db");
-            let store = MetadataStore::open(&db_path).unwrap();
-            let reader = MetadataReader::new(&db_path).unwrap();
+            let store = MetadataStore::open(&db_path).await.unwrap();
+            let reader = MetadataReader::new(&db_path).await.unwrap();
             let files = FilePaths::for_base(temp.path());
+            let www_root = temp.path().join("www");
+            std::fs::create_dir_all(&www_root).unwrap();
 
             Self {
                 state: AppState {
                     reader: Arc::new(reader),
                     cache: Arc::new(ApiCache::new()),
                     files: Arc::new(files),
+                    www_root: Arc::new(www_root),
                 },
                 db_path,
                 store,
@@ -810,32 +886,39 @@ mod tests {
             }
         }
 
-        fn insert_video(&mut self, id: &str) {
-            self.store.upsert_video(&sample_video(id)).unwrap();
+        async fn insert_video(&mut self, id: &str) {
+            self.store.upsert_video(&sample_video(id)).await.unwrap();
         }
 
-        fn insert_short(&mut self, id: &str) {
-            self.store.upsert_short(&sample_video(id)).unwrap();
+        async fn insert_short(&mut self, id: &str) {
+            self.store.upsert_short(&sample_video(id)).await.unwrap();
         }
 
-        fn insert_subtitles(&mut self, id: &str, tracks: Vec<SubtitleTrack>) {
+        async fn insert_subtitles(&mut self, id: &str, tracks: Vec<SubtitleTrack>) {
             self.store
                 .upsert_subtitles(&SubtitleCollection {
                     videoid: id.into(),
                     languages: tracks,
                 })
+                .await
                 .unwrap();
         }
 
-        fn insert_comments(&mut self, id: &str, comments: Vec<CommentRecord>) {
+        async fn insert_comments(&mut self, id: &str, comments: Vec<CommentRecord>) {
             self.store
                 .replace_comments(id, &comments)
+                .await
                 .expect("comments persisted");
         }
 
-        fn delete_by_videoid(&self, table: &str, value: &str) {
-            let conn = Connection::open(&self.db_path).unwrap();
-            conn.execute(&format!("DELETE FROM {table} WHERE videoid = ?1"), [value])
+        async fn delete_by_videoid(&self, table: &str, value: &str) {
+            let db = Builder::new_local(&self.db_path)
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(&format!("DELETE FROM {table} WHERE videoid = ?1"), params![value])
+                .await
                 .unwrap();
         }
     }
@@ -887,59 +970,92 @@ mod tests {
         }
     }
 
-    fn write_runtime_config(media: &str, www: &str, port: u16, host: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "MEDIA_ROOT=\"{media}\"\nWWW_ROOT=\"{www}\"\nNEWTUBE_PORT=\"{port}\"\nNEWTUBE_HOST=\"{host}\"\nAPP_VERSION=\"1.0\"\nDOMAIN_NAME=\"example.com\"\n"
-        )
-        .unwrap();
-        file
-    }
-
-    fn parse_backend_args(config: &NamedTempFile, extra: &[&str]) -> BackendArgs {
-        let mut argv = vec![
-            "--config".to_string(),
-            config.path().to_string_lossy().into_owned(),
-        ];
-        argv.extend(extra.iter().map(|value| value.to_string()));
-        BackendArgs::from_iter(argv).expect("parsed args")
+    fn parse_backend_args(env_values: &[(&str, &str)], extra: &[&str]) -> BackendArgs {
+        let argv = extra.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        let mut parsed = None;
+        with_env_file(env_values, || {
+            parsed = Some(BackendArgs::from_iter(argv.clone()).expect("parsed args"));
+        });
+        parsed.expect("args set")
     }
 
     #[test]
     fn backend_args_default_media_root() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
-        let args = parse_backend_args(&config, &[]);
+        let args = parse_backend_args(
+            &[
+                ("MEDIA_ROOT", "/yt/test"),
+                ("WWW_ROOT", "/www/test"),
+                ("NEWTUBE_PORT", "4242"),
+                ("NEWTUBE_HOST", "127.0.0.1"),
+            ],
+            &[],
+        );
         assert_eq!(args.media_root, PathBuf::from("/yt/test"));
+        assert_eq!(args.www_root, PathBuf::from("/www/test"));
         assert_eq!(args.newtube_port, 4242);
     }
 
     #[test]
     fn backend_args_override_media_root() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
-        let args = parse_backend_args(&config, &["--media-root", "/custom/media"]);
+        let args = parse_backend_args(
+            &[
+                ("MEDIA_ROOT", "/yt/test"),
+                ("WWW_ROOT", "/www/test"),
+                ("NEWTUBE_PORT", "4242"),
+                ("NEWTUBE_HOST", "127.0.0.1"),
+            ],
+            &["--media-root", "/custom/media"],
+        );
         assert_eq!(args.media_root, PathBuf::from("/custom/media"));
     }
 
     #[test]
+    fn backend_args_override_www_root() {
+        let args = parse_backend_args(
+            &[
+                ("MEDIA_ROOT", "/yt/test"),
+                ("WWW_ROOT", "/www/test"),
+                ("NEWTUBE_PORT", "4242"),
+                ("NEWTUBE_HOST", "127.0.0.1"),
+            ],
+            &["--www-root", "/custom/www"],
+        );
+        assert_eq!(args.www_root, PathBuf::from("/custom/www"));
+    }
+
+    #[test]
     fn backend_args_override_port() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
-        let args = parse_backend_args(&config, &["--port", "9000"]);
+        let args = parse_backend_args(
+            &[
+                ("MEDIA_ROOT", "/yt/test"),
+                ("WWW_ROOT", "/www/test"),
+                ("NEWTUBE_PORT", "4242"),
+                ("NEWTUBE_HOST", "127.0.0.1"),
+            ],
+            &["--port", "9000"],
+        );
         assert_eq!(args.newtube_port, 9000);
     }
 
     #[test]
     fn backend_args_override_host() {
-        let config = write_runtime_config("/yt/test", "/www/test", 4242, "127.0.0.1");
-        let args = parse_backend_args(&config, &["--host", "0.0.0.0"]);
+        let args = parse_backend_args(
+            &[
+                ("MEDIA_ROOT", "/yt/test"),
+                ("WWW_ROOT", "/www/test"),
+                ("NEWTUBE_PORT", "4242"),
+                ("NEWTUBE_HOST", "127.0.0.1"),
+            ],
+            &["--host", "0.0.0.0"],
+        );
         assert_eq!(args.listen_host, "0.0.0.0".parse::<IpAddr>().unwrap());
     }
 
     #[tokio::test]
     async fn bootstrap_caches_payload() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
-        ctx.insert_short("beta");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
+        ctx.insert_short("beta").await;
         ctx.insert_subtitles(
             "alpha",
             vec![SubtitleTrack {
@@ -948,21 +1064,22 @@ mod tests {
                 url: "/api/videos/alpha/subtitles/en".into(),
                 path: None,
             }],
-        );
-        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]);
+        )
+        .await;
+        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]).await;
 
         let first = ctx.state.get_bootstrap().await.unwrap();
         assert_eq!(first.videos.len(), 1);
 
-        ctx.insert_video("gamma");
+        ctx.insert_video("gamma").await;
         let second = ctx.state.get_bootstrap().await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]
     async fn media_list_populates_cache() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
 
         let list = ctx
             .state
@@ -970,7 +1087,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list.len(), 1);
-        ctx.delete_by_videoid("videos", "alpha");
+        ctx.delete_by_videoid("videos", "alpha").await;
 
         let cached = ctx
             .state
@@ -982,10 +1099,10 @@ mod tests {
 
     #[tokio::test]
     async fn api_responses_strip_file_paths() {
-        let ctx = BackendTestContext::new();
+        let ctx = BackendTestContext::new().await;
         let mut video = sample_video("alpha");
         video.sources[0].path = Some("/yt/videos/alpha/secret.mp4".into());
-        ctx.store.upsert_video(&video).unwrap();
+        ctx.store.upsert_video(&video).await.unwrap();
 
         let Json(videos) = super::list_videos(AxumState(ctx.state.clone()))
             .await
@@ -1003,8 +1120,8 @@ mod tests {
 
     #[tokio::test]
     async fn media_lookup_prefers_cache() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
         let record = ctx
             .state
             .get_media(MediaCategory::Video, "alpha")
@@ -1012,7 +1129,7 @@ mod tests {
             .unwrap();
         assert_eq!(record.videoid, "alpha");
 
-        ctx.delete_by_videoid("videos", "alpha");
+        ctx.delete_by_videoid("videos", "alpha").await;
         let cached = ctx
             .state
             .get_media(MediaCategory::Video, "alpha")
@@ -1030,9 +1147,9 @@ mod tests {
 
     #[tokio::test]
     async fn comments_and_subtitles_cache() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
-        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]);
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
+        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]).await;
         ctx.insert_subtitles(
             "alpha",
             vec![SubtitleTrack {
@@ -1041,25 +1158,26 @@ mod tests {
                 url: "/sub".into(),
                 path: None,
             }],
-        );
+        )
+        .await;
 
         let first_comments = ctx.state.get_comments("alpha").await.unwrap();
         assert_eq!(first_comments.len(), 1);
-        ctx.delete_by_videoid("comments", "alpha");
+        ctx.delete_by_videoid("comments", "alpha").await;
         let cached_comments = ctx.state.get_comments("alpha").await.unwrap();
         assert_eq!(cached_comments.len(), 1);
 
         let first_subtitles = ctx.state.get_subtitles("alpha").await.unwrap();
         assert!(first_subtitles.is_some());
-        ctx.delete_by_videoid("subtitles", "alpha");
+        ctx.delete_by_videoid("subtitles", "alpha").await;
         let cached_subtitles = ctx.state.get_subtitles("alpha").await.unwrap();
         assert!(cached_subtitles.is_some());
     }
 
     #[tokio::test]
     async fn list_subtitles_includes_download_urls() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
         ctx.insert_subtitles(
             "alpha",
             vec![SubtitleTrack {
@@ -1068,7 +1186,8 @@ mod tests {
                 url: "/api/videos/alpha/subtitles/en".into(),
                 path: None,
             }],
-        );
+        )
+        .await;
 
         let Json(payload) = super::list_subtitles(ctx.state.clone(), "alpha".into(), "videos")
             .await
@@ -1079,8 +1198,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_subtitle_uses_fallback_path() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
         ctx.insert_subtitles(
             "alpha",
             vec![SubtitleTrack {
@@ -1089,7 +1208,8 @@ mod tests {
                 url: "/api/videos/alpha/subtitles/en".into(),
                 path: None,
             }],
-        );
+        )
+        .await;
 
         let subtitle_dir = ctx.state.files.subtitles.join("alpha");
         std::fs::create_dir_all(&subtitle_dir).unwrap();
@@ -1103,7 +1223,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_thumbnail_serves_local_files() {
-        let ctx = BackendTestContext::new();
+        let ctx = BackendTestContext::new().await;
         let thumb_dir = ctx.state.files.thumbnails.join("alpha");
         std::fs::create_dir_all(&thumb_dir).unwrap();
         std::fs::write(thumb_dir.join("poster.png"), b"PNG").unwrap();
@@ -1118,7 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_thumbnail_rejects_path_traversal() {
-        let ctx = BackendTestContext::new();
+        let ctx = BackendTestContext::new().await;
         let err = download_thumbnail(ctx.state.clone(), "alpha".into(), "../secret.txt".into())
             .await
             .unwrap_err();
@@ -1127,13 +1247,13 @@ mod tests {
 
     #[tokio::test]
     async fn stream_media_uses_custom_path() {
-        let ctx = BackendTestContext::new();
+        let ctx = BackendTestContext::new().await;
         let mut video = sample_video("alpha");
         let custom = ctx.state.files.videos.join("custom.mp4");
         std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
         std::fs::write(&custom, "bytes").unwrap();
         video.sources[0].path = Some(custom.to_string_lossy().into_owned());
-        ctx.store.upsert_video(&video).unwrap();
+        ctx.store.upsert_video(&video).await.unwrap();
 
         let response = stream_media(
             ctx.state.clone(),
@@ -1152,10 +1272,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_media_builds_default_path() {
-        let ctx = BackendTestContext::new();
+        let ctx = BackendTestContext::new().await;
         let mut video = sample_video("alpha");
         video.sources[0].path = None;
-        ctx.store.upsert_video(&video).unwrap();
+        ctx.store.upsert_video(&video).await.unwrap();
         let media_dir = ctx
             .state
             .files
@@ -1177,8 +1297,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_media_missing_format_errors() {
-        let mut ctx = BackendTestContext::new();
-        ctx.insert_video("alpha");
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
         let err = stream_media(
             ctx.state.clone(),
             MediaCategory::Video,

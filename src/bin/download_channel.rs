@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, Utc};
-use newtube_tools::config::load_runtime_paths;
+use newtube_tools::config::{RuntimeOverrides, resolve_runtime_paths};
 use newtube_tools::metadata::{
     CommentRecord, MetadataStore, SubtitleCollection, SubtitleTrack, VideoRecord, VideoSource,
 };
@@ -161,7 +161,11 @@ impl DownloaderArgs {
             )
         })?;
 
-        let runtime_paths = load_runtime_paths()?;
+        let runtime_paths = resolve_runtime_paths(RuntimeOverrides {
+            media_root: media_root_override.clone(),
+            www_root: www_root_override.clone(),
+            ..RuntimeOverrides::default()
+        })?;
         let media_root = media_root_override.unwrap_or_else(|| runtime_paths.media_root.clone());
         let www_root = www_root_override.unwrap_or_else(|| runtime_paths.www_root.clone());
 
@@ -194,6 +198,65 @@ struct FormatEntry {
     format_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
+        match self {
+            OneOrMany::One(value) => Box::new(std::iter::once(value)),
+            OneOrMany::Many(values) => Box::new(values.iter()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum CreatorInfo {
+    Name(String),
+    Object {
+        name: Option<String>,
+        title: Option<String>,
+        url: Option<String>,
+        id: Option<String>,
+        channel_url: Option<String>,
+        channel_id: Option<String>,
+    },
+}
+
+impl CreatorInfo {
+    fn name(&self) -> Option<&str> {
+        match self {
+            CreatorInfo::Name(value) => Some(value.as_str()),
+            CreatorInfo::Object { name, title, .. } => name
+                .as_deref()
+                .or_else(|| title.as_deref()),
+        }
+    }
+
+    fn url(&self) -> Option<&str> {
+        match self {
+            CreatorInfo::Name(_) => None,
+            CreatorInfo::Object { url, channel_url, .. } => {
+                url.as_deref().or_else(|| channel_url.as_deref())
+            }
+        }
+    }
+
+    fn id(&self) -> Option<&str> {
+        match self {
+            CreatorInfo::Name(_) => None,
+            CreatorInfo::Object { id, channel_id, .. } => {
+                id.as_deref().or_else(|| channel_id.as_deref())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 /// Full `yt-dlp --dump-single-json` payload. Only a subset of fields are read
 /// but everything is left optional because older videos may lack metadata.
@@ -207,10 +270,13 @@ struct VideoInfo {
     upload_date: Option<String>,
     #[serde(default)]
     release_timestamp: Option<i64>,
-    uploader: Option<String>,
-    channel: Option<String>,
-    channel_id: Option<String>,
-    channel_url: Option<String>,
+    uploader: Option<OneOrMany<CreatorInfo>>,
+    uploader_url: Option<OneOrMany<String>>,
+    channel: Option<OneOrMany<CreatorInfo>>,
+    channel_id: Option<OneOrMany<String>>,
+    channel_url: Option<OneOrMany<String>>,
+    #[serde(default)]
+    creators: Option<Vec<CreatorInfo>>,
     #[serde(rename = "channel_follower_count")]
     channel_follower_count: Option<i64>,
     duration: Option<i64>,
@@ -316,7 +382,7 @@ async fn main() -> Result<()> {
 
     download_collection(
         "regular videos",
-        format!("{}/videos", &channel_url),
+        build_channel_list_url(&channel_url, MediaKind::Video),
         Some("!is_live & original_url!*=/shorts/"),
         &paths,
         &mut archive,
@@ -327,7 +393,7 @@ async fn main() -> Result<()> {
 
     download_collection(
         "shorts",
-        format!("{}/shorts", &channel_url),
+        build_channel_list_url(&channel_url, MediaKind::Short),
         Some("original_url*=/shorts/"),
         &paths,
         &mut archive,
@@ -682,7 +748,19 @@ fn build_video_record(
         .clone()
         .or_else(|| duration.map(format_duration));
 
-    let author = info.channel.clone().or_else(|| info.uploader.clone());
+    let creators = collect_creator_names(info);
+    let channel_names = collect_channel_names(info);
+    let uploader_names = collect_uploader_names(info);
+    let author_names = collect_author_names(&creators, &channel_names, &uploader_names);
+    let author = if author_names.is_empty() {
+        None
+    } else {
+        Some(author_names.join(", "))
+    };
+
+    let channel_ids = collect_channel_ids(info);
+    let channel_urls = collect_channel_urls(info);
+    let channel_url = channel_urls.first().cloned();
 
     let slug = media_kind_slug(media_kind);
 
@@ -692,8 +770,14 @@ fn build_video_record(
     let sources = collect_sources(video_id, info, output_dir, slug)?;
 
     let extras = json!({
-        "channelId": info.channel_id,
+        "channelId": channel_ids.first().cloned(),
+        "channelIds": channel_ids,
+        "channelNames": author_names.clone(),
+        "creatorNames": creators,
+        "channelFieldNames": channel_names,
+        "channelUrls": channel_urls,
         "commentCount": info.comment_count,
+        "uploaderNames": uploader_names,
     });
 
     Ok(VideoRecord {
@@ -708,13 +792,140 @@ fn build_video_record(
         subscriber_count: info.channel_follower_count,
         duration,
         duration_text,
-        channel_url: info.channel_url.clone(),
+        channel_url,
         thumbnail_url,
         tags: info.tags.clone().unwrap_or_default(),
         thumbnails,
         extras,
         sources,
     })
+}
+
+fn collect_creator_names(info: &VideoInfo) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(creators) = &info.creators {
+        for creator in creators {
+            if let Some(name) = creator.name() {
+                push_unique(&mut names, name);
+            }
+        }
+    }
+    names
+}
+
+fn collect_channel_names(info: &VideoInfo) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(channel) = &info.channel {
+        for creator in channel.iter() {
+            if let Some(name) = creator.name() {
+                push_unique(&mut names, name);
+            }
+        }
+    }
+    names
+}
+
+fn collect_uploader_names(info: &VideoInfo) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(uploader) = &info.uploader {
+        for creator in uploader.iter() {
+            if let Some(name) = creator.name() {
+                push_unique(&mut names, name);
+            }
+        }
+    }
+    names
+}
+
+fn collect_channel_ids(info: &VideoInfo) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(channel_ids) = &info.channel_id {
+        for id in channel_ids.iter() {
+            push_unique(&mut ids, id);
+        }
+    }
+    if let Some(channel) = &info.channel {
+        for creator in channel.iter() {
+            if let Some(id) = creator.id() {
+                push_unique(&mut ids, id);
+            }
+        }
+    }
+    if let Some(uploader) = &info.uploader {
+        for creator in uploader.iter() {
+            if let Some(id) = creator.id() {
+                push_unique(&mut ids, id);
+            }
+        }
+    }
+    if let Some(creators) = &info.creators {
+        for creator in creators {
+            if let Some(id) = creator.id() {
+                push_unique(&mut ids, id);
+            }
+        }
+    }
+    ids
+}
+
+fn collect_channel_urls(info: &VideoInfo) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(channel_urls) = &info.channel_url {
+        for url in channel_urls.iter() {
+            push_unique(&mut urls, url);
+        }
+    }
+    if let Some(channel) = &info.channel {
+        for creator in channel.iter() {
+            if let Some(url) = creator.url() {
+                push_unique(&mut urls, url);
+            }
+        }
+    }
+    if let Some(uploader_urls) = &info.uploader_url {
+        for url in uploader_urls.iter() {
+            push_unique(&mut urls, url);
+        }
+    }
+    if let Some(uploader) = &info.uploader {
+        for creator in uploader.iter() {
+            if let Some(url) = creator.url() {
+                push_unique(&mut urls, url);
+            }
+        }
+    }
+    if let Some(creators) = &info.creators {
+        for creator in creators {
+            if let Some(url) = creator.url() {
+                push_unique(&mut urls, url);
+            }
+        }
+    }
+    urls
+}
+
+fn push_unique(list: &mut Vec<String>, value: &str) {
+    if !list.iter().any(|entry| entry == value) {
+        list.push(value.to_string());
+    }
+}
+
+fn collect_author_names(
+    creators: &[String],
+    channel_names: &[String],
+    uploader_names: &[String],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in creators {
+        push_unique(&mut names, name);
+    }
+    for name in channel_names {
+        push_unique(&mut names, name);
+    }
+    for name in uploader_names {
+        push_unique(&mut names, name);
+    }
+    names
 }
 
 /// Gathers subtitle tracks saved locally, falling back to the remote URL when
@@ -769,14 +980,6 @@ fn collect_subtitles(
         }
     }
 
-    if tracks.is_empty() {
-        // If nothing was saved locally we still return the first remote track so
-        // the frontend can show at least a single caption option.
-        if let Some(remote) = first_remote_subtitle(info) {
-            tracks.push(remote);
-        }
-    }
-
     Ok(SubtitleCollection {
         videoid: video_id.to_owned(),
         languages: tracks,
@@ -808,33 +1011,6 @@ fn subtitle_name_map(info: &VideoInfo) -> HashMap<String, String> {
         }
     }
     names
-}
-
-/// Helper that returns the first remote subtitle entry so the frontend can
-/// still offer captions even if local downloads failed.
-fn first_remote_subtitle(info: &VideoInfo) -> Option<SubtitleTrack> {
-    let iter = info.subtitles.iter().chain(info.automatic_captions.iter());
-
-    for map in iter {
-        for (code, entries) in map {
-            if let Some(entry) = entries.first()
-                && let Some(url) = &entry.url
-            {
-                let name = entry
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| code.to_ascii_uppercase());
-                return Some(SubtitleTrack {
-                    code: code.to_owned(),
-                    name,
-                    url: url.clone(),
-                    path: None,
-                });
-            }
-        }
-    }
-
-    None
 }
 
 /// Returns a sorted list of thumbnail URLs served via the backend.
@@ -933,6 +1109,66 @@ fn collect_sources(
         }
     }
 
+    if sources.is_empty() {
+        sources = collect_sources_from_disk(video_id, &base_dir, slug)?;
+    }
+
+    Ok(sources)
+}
+
+fn collect_sources_from_disk(
+    video_id: &str,
+    base_dir: &Path,
+    slug: &str,
+) -> Result<Vec<VideoSource>> {
+    let mut sources = Vec::new();
+    let prefix = format!("{video_id}_");
+    for entry in fs::read_dir(base_dir)
+        .with_context(|| format!("reading media dir {}", base_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.path().is_file() {
+            continue;
+        }
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+        if !file_name.starts_with(&prefix) {
+            continue;
+        }
+        if file_name.ends_with(".part") {
+            continue;
+        }
+        let rest = &file_name[prefix.len()..];
+        let Some((format_id, ext)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if format_id.is_empty() {
+            continue;
+        }
+        if matches!(ext, "m4a" | "mp3" | "aac" | "opus" | "flac" | "wav") {
+            continue;
+        }
+        if matches!(ext, "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2") {
+            continue;
+        }
+        let size = entry.metadata().ok().map(|meta| meta.len() as i64);
+        sources.push(VideoSource {
+            format_id: format_id.to_owned(),
+            quality_label: None,
+            width: None,
+            height: None,
+            fps: None,
+            mime_type: Some(mime_from_extension(ext)),
+            ext: Some(ext.to_owned()),
+            file_size: size,
+            url: format!("/api/{slug}/{}/streams/{}", video_id, format_id),
+            path: Some(entry.path().to_string_lossy().into_owned()),
+        });
+    }
+
+    sources.sort_by(|a, b| a.format_id.cmp(&b.format_id));
     Ok(sources)
 }
 
@@ -998,39 +1234,85 @@ fn fetch_comments(video_id: &str, video_url: &str, paths: &Paths) -> Result<Vec<
         _ => Vec::new(),
     };
 
+    let mut raw_comments = Vec::new();
+    for value in comments_array {
+        collect_raw_comments(value, None, &mut raw_comments);
+    }
+
     let mut comments = Vec::new();
     let mut seen_ids = HashSet::new();
-    for value in comments_array {
-        match serde_json::from_value::<RawComment>(value) {
-            Ok(raw) => {
-                if !seen_ids.insert(raw.id.clone()) {
-                    continue;
-                }
-                let time_posted = raw
-                    .timestamp
-                    .and_then(timestamp_to_iso)
-                    .or_else(|| raw.time_text.clone())
-                    .or_else(|| Some(Utc::now().to_rfc3339()));
-
-                comments.push(CommentRecord {
-                    id: raw.id,
-                    videoid: video_id.to_owned(),
-                    author: raw.author.unwrap_or_default(),
-                    text: raw.text.unwrap_or_default(),
-                    likes: raw.like_count,
-                    time_posted,
-                    parent_comment_id: raw.parent,
-                    status_likedbycreator: raw.author_is_channel_owner || raw.author_is_uploader,
-                    reply_count: raw.reply_count,
-                });
-            }
-            Err(err) => {
-                eprintln!("  Warning: could not parse comment entry: {}", err);
-            }
+    for raw in raw_comments {
+        if !seen_ids.insert(raw.id.clone()) {
+            continue;
         }
+
+        let time_posted = raw
+            .timestamp
+            .and_then(timestamp_to_iso)
+            .or_else(|| raw.time_text.as_deref().and_then(parse_time_text));
+
+        comments.push(CommentRecord {
+            id: raw.id,
+            videoid: video_id.to_owned(),
+            author: raw.author.unwrap_or_default(),
+            text: raw.text.unwrap_or_default(),
+            likes: raw.like_count,
+            time_posted,
+            parent_comment_id: raw.parent,
+            status_likedbycreator: raw.author_is_channel_owner || raw.author_is_uploader,
+            reply_count: raw.reply_count,
+        });
     }
 
     Ok(comments)
+}
+
+fn collect_raw_comments(value: Value, parent_hint: Option<&str>, out: &mut Vec<RawComment>) {
+    match value {
+        Value::Array(arr) => {
+            for entry in arr {
+                collect_raw_comments(entry, parent_hint, out);
+            }
+        }
+        Value::Object(mut map) => {
+            if !map.contains_key("id") {
+                if let Some(value) = map.remove("comments") {
+                    collect_raw_comments(value, parent_hint, out);
+                }
+                if let Some(value) = map.remove("items") {
+                    collect_raw_comments(value, parent_hint, out);
+                }
+                if let Some(value) = map.remove("replies") {
+                    collect_raw_comments(value, parent_hint, out);
+                }
+                return;
+            }
+
+            let replies_value = map.remove("replies");
+            let comment_value = Value::Object(map);
+            match serde_json::from_value::<RawComment>(comment_value) {
+                Ok(mut raw) => {
+                    if raw.parent.is_none() {
+                        if let Some(parent) = parent_hint {
+                            raw.parent = Some(parent.to_string());
+                        }
+                    }
+                    let current_id = raw.id.clone();
+                    out.push(raw);
+                    if let Some(replies) = replies_value {
+                        collect_raw_comments(replies, Some(&current_id), out);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("  Warning: could not parse comment entry: {}", err);
+                    if let Some(replies) = replies_value {
+                        collect_raw_comments(replies, parent_hint, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Creates a human-friendly label such as `1080p HDR` when the metadata is
@@ -1070,6 +1352,40 @@ fn media_kind_slug(kind: MediaKind) -> &'static str {
     }
 }
 
+/// Normalizes a channel URL so we don't double-append `/videos` or `/shorts`.
+fn build_channel_list_url(channel_url: &str, kind: MediaKind) -> String {
+    let (without_fragment, fragment) = match channel_url.split_once('#') {
+        Some((base, fragment)) => (base, Some(fragment)),
+        None => (channel_url, None),
+    };
+    let (base, query) = match without_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (without_fragment, None),
+    };
+
+    let base = base.trim_end_matches('/');
+    let suffix = match kind {
+        MediaKind::Video => "/videos",
+        MediaKind::Short => "/shorts",
+    };
+    let mut result = if base.ends_with(suffix) {
+        base.to_string()
+    } else {
+        format!("{base}{suffix}")
+    };
+
+    if let Some(query) = query {
+        result.push('?');
+        result.push_str(query);
+    }
+    if let Some(fragment) = fragment {
+        result.push('#');
+        result.push_str(fragment);
+    }
+
+    result
+}
+
 /// Converts yt-dlp's `YYYYMMDD` upload date format into ISO-8601.
 fn upload_date_to_iso(value: &str) -> Option<String> {
     if value.len() != 8 {
@@ -1086,6 +1402,25 @@ fn upload_date_to_iso(value: &str) -> Option<String> {
 /// Converts epoch seconds into an ISO-8601 string.
 fn timestamp_to_iso(timestamp: i64) -> Option<String> {
     chrono::DateTime::<Utc>::from_timestamp(timestamp, 0).map(|datetime| datetime.to_rfc3339())
+}
+
+/// Parses known absolute time strings into ISO-8601. Relative strings are ignored.
+fn parse_time_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(datetime.to_rfc3339());
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let naive = date.and_hms_opt(0, 0, 0)?;
+        return Some(format!("{}Z", naive.format("%Y-%m-%dT%H:%M:%S")));
+    }
+
+    None
 }
 
 /// Renders durations as `H:MM:SS` or `M:SS` for short clips.
@@ -1159,14 +1494,19 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
     let formats = collect_format_ids(&info_json_path, &video_url)?;
 
     if formats.is_empty() {
-        println!("  No downloadable formats found for {}", video_id);
-        return Ok(());
+        bail!("no downloadable formats found for {}", video_id);
     }
 
+    let mut downloaded_any = false;
     for format_id in formats {
         let safe_format_id = sanitize_format_id(&format_id);
         let mut output_path = video_dir.join(format!("{}_{}", video_id, safe_format_id));
         output_path.set_extension("%(ext)s");
+
+        if format_output_exists(&video_dir, video_id, &safe_format_id) {
+            downloaded_any = true;
+            continue;
+        }
 
         println!("  Downloading format: {}", format_id);
 
@@ -1200,11 +1540,53 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
                 eprintln!("    Failed to download format {}: {}", format_id, err);
             }
         }
+
+        if format_output_exists(&video_dir, video_id, &safe_format_id) {
+            downloaded_any = true;
+        }
     }
 
     println!("  Completed: {}", video_id);
 
+    if !downloaded_any {
+        bail!("no formats downloaded for {}", video_id);
+    }
+
     Ok(())
+}
+
+fn format_output_exists(video_dir: &Path, video_id: &str, format_id: &str) -> bool {
+    let prefix = format!("{video_id}_{format_id}");
+    if let Ok(entries) = fs::read_dir(video_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with(&prefix)
+                    || name.chars().nth(prefix.len()) != Some('.')
+                {
+                    continue;
+                }
+
+                if name.ends_with(".part") {
+                    continue;
+                }
+
+                let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+                if matches!(ext, "m4a" | "mp3" | "aac" | "opus" | "flac" | "wav") {
+                    continue;
+                }
+                if matches!(ext, "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2") {
+                    continue;
+                }
+
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Wrapper for the metadata/description/thumbnail yt-dlp call.
@@ -1360,7 +1742,10 @@ fn collect_format_ids(info_json_path: &Path, video_url: &str) -> Result<Vec<Stri
                 }
 
                 if let Some(first) = trimmed.split_whitespace().next() {
-                    if first.eq_ignore_ascii_case("format") || first.eq_ignore_ascii_case("code") {
+                    if first.eq_ignore_ascii_case("format")
+                        || first.eq_ignore_ascii_case("code")
+                        || first.eq_ignore_ascii_case("id")
+                    {
                         continue;
                     }
                     if first
@@ -1481,9 +1866,11 @@ mod tests {
             upload_date: Some("20240101".into()),
             release_timestamp: None,
             uploader: None,
-            channel: Some("Channel".into()),
-            channel_id: Some("channel123".into()),
-            channel_url: Some("https://example.com/channel".into()),
+            uploader_url: None,
+            channel: Some(OneOrMany::One(CreatorInfo::Name("Channel".into()))),
+            channel_id: Some(OneOrMany::One("channel123".into())),
+            channel_url: Some(OneOrMany::One("https://example.com/channel".into())),
+            creators: None,
             channel_follower_count: Some(100),
             duration: Some(120),
             duration_string: None,
@@ -1751,7 +2138,7 @@ exit 0
     }
 
     #[test]
-    fn collect_subtitles_falls_back_to_remote_track() -> Result<()> {
+    fn collect_subtitles_ignores_remote_tracks() -> Result<()> {
         let (_temp, paths) = temp_paths();
         let mut info = sample_video_info();
         let mut subs = HashMap::new();
@@ -1765,10 +2152,7 @@ exit 0
         info.subtitles = Some(subs);
 
         let collection = collect_subtitles("abc", &info, &paths, MediaKind::Video)?;
-        assert_eq!(collection.languages.len(), 1);
-        let track = &collection.languages[0];
-        assert!(track.path.is_none());
-        assert_eq!(track.url, "https://remote/en.vtt");
+        assert!(collection.languages.is_empty());
         Ok(())
     }
 

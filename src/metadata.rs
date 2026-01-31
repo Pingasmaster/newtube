@@ -126,6 +126,126 @@ async fn configure_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS videos (
+            videoid TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            likes INTEGER,
+            dislikes INTEGER,
+            views INTEGER,
+            upload_date TEXT,
+            author TEXT,
+            subscriber_count INTEGER,
+            duration INTEGER,
+            duration_text TEXT,
+            channel_url TEXT,
+            thumbnail_url TEXT,
+            tags_json TEXT DEFAULT '[]',
+            thumbnails_json TEXT DEFAULT '[]',
+            extras_json TEXT DEFAULT 'null',
+            sources_json TEXT DEFAULT '[]'
+        );
+
+        CREATE TABLE IF NOT EXISTS shorts (
+            videoid TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            likes INTEGER,
+            dislikes INTEGER,
+            views INTEGER,
+            upload_date TEXT,
+            author TEXT,
+            subscriber_count INTEGER,
+            duration INTEGER,
+            duration_text TEXT,
+            channel_url TEXT,
+            thumbnail_url TEXT,
+            tags_json TEXT DEFAULT '[]',
+            thumbnails_json TEXT DEFAULT '[]',
+            extras_json TEXT DEFAULT 'null',
+            sources_json TEXT DEFAULT '[]'
+        );
+
+        CREATE TABLE IF NOT EXISTS subtitles (
+            videoid TEXT PRIMARY KEY,
+            languages_json TEXT NOT NULL DEFAULT '[]'
+        );
+
+        CREATE TABLE IF NOT EXISTS comments (
+            id TEXT PRIMARY KEY,
+            videoid TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            text TEXT DEFAULT '',
+            likes INTEGER,
+            time_posted TEXT,
+            parent_comment_id TEXT,
+            status_likedbycreator INTEGER NOT NULL DEFAULT 0,
+            reply_count INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_comments_videoid ON comments(videoid);
+        CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_comment_id);
+        "#,
+    )
+    .await?;
+
+    migrate_comments_schema(conn).await?;
+
+    Ok(())
+}
+
+async fn migrate_comments_schema(conn: &Connection) -> Result<()> {
+    let mut rows = conn.query("PRAGMA foreign_key_list(comments)", params![]).await?;
+    let mut has_video_fk = false;
+    while let Some(row) = rows.next().await? {
+        let table: String = row.get(2)?;
+        if table == "videos" {
+            has_video_fk = true;
+            break;
+        }
+    }
+
+    if !has_video_fk {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS comments_new (
+            id TEXT PRIMARY KEY,
+            videoid TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            text TEXT DEFAULT '',
+            likes INTEGER,
+            time_posted TEXT,
+            parent_comment_id TEXT,
+            status_likedbycreator INTEGER NOT NULL DEFAULT 0,
+            reply_count INTEGER
+        );
+        INSERT INTO comments_new (
+            id, videoid, author, text, likes, time_posted,
+            parent_comment_id, status_likedbycreator, reply_count
+        )
+        SELECT
+            id, videoid, author, text, likes, time_posted,
+            parent_comment_id, status_likedbycreator, reply_count
+        FROM comments;
+        DROP TABLE comments;
+        ALTER TABLE comments_new RENAME TO comments;
+        CREATE INDEX IF NOT EXISTS idx_comments_videoid ON comments(videoid);
+        CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_comment_id);
+        COMMIT;
+        "#,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Wrapper around the SQLite-compatible connection that performs read/write operations.
 #[derive(Debug)]
 pub struct MetadataStore {
@@ -156,73 +276,7 @@ impl MetadataStore {
 
     /// Runs the SQL required to create the tables if they do not already exist.
     async fn ensure_tables(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS videos (
-                videoid TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                likes INTEGER,
-                dislikes INTEGER,
-                views INTEGER,
-                upload_date TEXT,
-                author TEXT,
-                subscriber_count INTEGER,
-                duration INTEGER,
-                duration_text TEXT,
-                channel_url TEXT,
-                thumbnail_url TEXT,
-                tags_json TEXT DEFAULT '[]',
-                thumbnails_json TEXT DEFAULT '[]',
-                extras_json TEXT DEFAULT 'null',
-                sources_json TEXT DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS shorts (
-                videoid TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                likes INTEGER,
-                dislikes INTEGER,
-                views INTEGER,
-                upload_date TEXT,
-                author TEXT,
-                subscriber_count INTEGER,
-                duration INTEGER,
-                duration_text TEXT,
-                channel_url TEXT,
-                thumbnail_url TEXT,
-                tags_json TEXT DEFAULT '[]',
-                thumbnails_json TEXT DEFAULT '[]',
-                extras_json TEXT DEFAULT 'null',
-                sources_json TEXT DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS subtitles (
-                videoid TEXT PRIMARY KEY,
-                languages_json TEXT NOT NULL DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS comments (
-                id TEXT PRIMARY KEY,
-                videoid TEXT NOT NULL,
-                author TEXT DEFAULT '',
-                text TEXT DEFAULT '',
-                likes INTEGER,
-                time_posted TEXT,
-                parent_comment_id TEXT,
-                status_likedbycreator INTEGER NOT NULL DEFAULT 0,
-                reply_count INTEGER,
-                FOREIGN KEY (videoid) REFERENCES videos(videoid) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_comments_videoid ON comments(videoid);
-            CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_comment_id);
-            "#,
-        )
-        .await?;
-        Ok(())
+        ensure_schema(&self.conn).await
     }
 
     /// Inserts or updates a long-form video entry.
@@ -376,6 +430,7 @@ impl MetadataReader {
             .with_context(|| format!("opening metadata DB {}", path.as_ref().display()))?;
         let conn = db.connect()?;
         configure_connection(&conn).await?;
+        ensure_schema(&conn).await?;
         Ok(Self { conn })
     }
 
@@ -452,7 +507,11 @@ impl MetadataReader {
                        parent_comment_id, status_likedbycreator, reply_count
                 FROM comments
                 WHERE videoid = ?1
-                ORDER BY time_posted ASC
+                  AND (
+                    EXISTS (SELECT 1 FROM videos WHERE videoid = ?1)
+                    OR EXISTS (SELECT 1 FROM shorts WHERE videoid = ?1)
+                  )
+                ORDER BY datetime(time_posted) IS NULL, datetime(time_posted) ASC, rowid ASC
                 "#,
             )
             .await?;
@@ -473,7 +532,12 @@ impl MetadataReader {
                 SELECT id, videoid, author, text, likes, time_posted,
                        parent_comment_id, status_likedbycreator, reply_count
                 FROM comments
-                ORDER BY time_posted ASC
+                WHERE videoid IN (
+                    SELECT videoid FROM videos
+                    UNION
+                    SELECT videoid FROM shorts
+                )
+                ORDER BY datetime(time_posted) IS NULL, datetime(time_posted) ASC, rowid ASC
                 "#,
             )
             .await?;
@@ -484,6 +548,16 @@ impl MetadataReader {
             comments.push(row_to_comment(&row)?);
         }
         Ok(comments)
+    }
+
+    pub async fn data_version(&self) -> Result<i64> {
+        let conn = &self.conn;
+        let mut rows = conn.query("PRAGMA data_version", params![]).await?;
+        let row = rows
+            .next()
+            .await?
+            .context("missing data_version row")?;
+        Ok(row.get(0)?)
     }
 
     async fn fetch_videos_from(&self, table: &str) -> Result<Vec<VideoRecord>> {

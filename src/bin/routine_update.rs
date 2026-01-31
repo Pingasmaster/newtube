@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use newtube_tools::{
-    config::load_runtime_paths,
+    config::{RuntimeOverrides, resolve_runtime_paths},
     metadata::MetadataStore,
     security::ensure_not_root,
 };
@@ -77,7 +77,11 @@ impl RoutineArgs {
             }
         }
 
-        let runtime_paths = load_runtime_paths()?;
+        let runtime_paths = resolve_runtime_paths(RuntimeOverrides {
+            media_root: media_root_override.clone(),
+            www_root: www_root_override.clone(),
+            ..RuntimeOverrides::default()
+        })?;
         let media_root = media_root_override.unwrap_or(runtime_paths.media_root);
         let www_root = www_root_override.unwrap_or(runtime_paths.www_root);
 
@@ -88,11 +92,58 @@ impl RoutineArgs {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
+        match self {
+            OneOrMany::One(value) => Box::new(std::iter::once(value)),
+            OneOrMany::Many(values) => Box::new(values.iter()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CreatorInfo {
+    Name(String),
+    Object {
+        url: Option<String>,
+        channel_url: Option<String>,
+        uploader_url: Option<String>,
+    },
+}
+
+impl CreatorInfo {
+    fn url(&self) -> Option<&str> {
+        match self {
+            CreatorInfo::Name(_) => None,
+            CreatorInfo::Object {
+                url,
+                channel_url,
+                uploader_url,
+            } => url
+                .as_deref()
+                .or_else(|| channel_url.as_deref())
+                .or_else(|| uploader_url.as_deref()),
+        }
+    }
+}
+
 /// Only grab the small subset of fields we need from `.info.json`.
 #[derive(Deserialize)]
 struct MinimalInfo {
-    channel_url: Option<String>,
-    uploader_url: Option<String>,
+    channel_url: Option<OneOrMany<String>>,
+    uploader_url: Option<OneOrMany<String>>,
+    #[serde(default)]
+    creators: Option<Vec<CreatorInfo>>,
+    channel: Option<OneOrMany<CreatorInfo>>,
+    uploader: Option<OneOrMany<CreatorInfo>>,
 }
 
 /// Scans on-disk metadata, identifies unique channels, and launches
@@ -227,8 +278,10 @@ fn extract_channel_url(path: &Path) -> Result<Option<String>> {
 
     match serde_json::from_reader::<_, MinimalInfo>(reader) {
         Ok(info) => {
-            let url = info.channel_url.or(info.uploader_url);
-            Ok(url.map(|u| u.trim().to_owned()))
+            if let Some(url) = first_url(&info) {
+                return Ok(Some(url.trim().to_owned()));
+            }
+            Ok(None)
         }
         Err(err) => {
             eprintln!("  Warning: could not parse {}: {}", path.display(), err);
@@ -237,11 +290,58 @@ fn extract_channel_url(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn first_url(info: &MinimalInfo) -> Option<&str> {
+    if let Some(channel_urls) = &info.channel_url {
+        for url in channel_urls.iter() {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(uploader_urls) = &info.uploader_url {
+        for url in uploader_urls.iter() {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(channel) = &info.channel {
+        for creator in channel.iter() {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(uploader) = &info.uploader {
+        for creator in uploader.iter() {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(creators) = &info.creators {
+        for creator in creators {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
 /// Returns a lowercase, slash-normalized version of the channel URL for
 /// deduplication.
 fn canonicalize_channel_url(url: &str) -> String {
     let trimmed = url.trim();
-    let without_slash = trimmed.trim_end_matches('/');
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_slash = without_query.trim_end_matches('/');
     without_slash.to_ascii_lowercase()
 }
 

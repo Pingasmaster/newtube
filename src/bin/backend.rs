@@ -23,7 +23,7 @@ use axum::{
     routing::get,
 };
 use mime_guess::{MimeGuess, mime::Mime};
-use newtube_tools::config::load_runtime_paths;
+use newtube_tools::config::{RuntimeOverrides, resolve_runtime_paths};
 use newtube_tools::metadata::{
     CommentRecord, MetadataReader, SubtitleCollection, VideoRecord, VideoSource,
 };
@@ -34,7 +34,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
-use tokio::{fs::File, signal};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}, signal};
 use tokio_util::io::ReaderStream;
 
 // Directory layout defaults. Keeping them centralized means the same values
@@ -116,7 +116,11 @@ impl BackendArgs {
             }
         }
 
-        let runtime_paths = load_runtime_paths()?;
+        let runtime_paths = resolve_runtime_paths(RuntimeOverrides {
+            media_root: media_root_override.clone(),
+            www_root: www_root_override.clone(),
+            ..RuntimeOverrides::default()
+        })?;
         let runtime_host = parse_host_arg(&runtime_paths.newtube_host)?;
         let media_root = media_root_override.unwrap_or(runtime_paths.media_root);
         let www_root = www_root_override.unwrap_or(runtime_paths.www_root);
@@ -176,6 +180,7 @@ struct ApiCache {
     comments: RwLock<HashMap<String, Vec<CommentRecord>>>,
     subtitles: RwLock<HashMap<String, SubtitleCollection>>,
     bootstrap: RwLock<Option<Arc<BootstrapPayload>>>,
+    last_db_version: RwLock<Option<i64>>,
 }
 
 impl ApiCache {
@@ -190,6 +195,7 @@ impl ApiCache {
             comments: RwLock::new(HashMap::new()),
             subtitles: RwLock::new(HashMap::new()),
             bootstrap: RwLock::new(None),
+            last_db_version: RwLock::new(None),
         }
     }
 
@@ -205,6 +211,16 @@ impl ApiCache {
             MediaCategory::Video => &self.video_details,
             MediaCategory::Short => &self.short_details,
         }
+    }
+
+    fn clear(&self) {
+        self.videos.write().take();
+        self.shorts.write().take();
+        self.video_details.write().clear();
+        self.short_details.write().clear();
+        self.comments.write().clear();
+        self.subtitles.write().clear();
+        self.bootstrap.write().take();
     }
 }
 
@@ -388,15 +404,24 @@ async fn static_fallback(State(state): State<AppState>, req: Request<Body>) -> R
 }
 
 async fn serve_www_path(root: &Path, request_path: &str) -> ApiResult<Response> {
-    let mut target = resolve_www_path(root, request_path)?;
-    let is_dir = tokio::fs::metadata(&target)
-        .await
-        .map(|meta| meta.is_dir())
-        .unwrap_or(true);
-    if is_dir {
-        target = root.join("index.html");
+    let target = resolve_www_path(root, request_path)?;
+    let metadata = tokio::fs::metadata(&target).await;
+
+    match metadata {
+        Ok(meta) if meta.is_dir() => {
+            let index = root.join("index.html");
+            stream_file(index, None, None).await
+        }
+        Ok(_) => stream_file(target, None, None).await,
+        Err(_) => {
+            if should_fallback_to_index(request_path) {
+                let index = root.join("index.html");
+                stream_file(index, None, None).await
+            } else {
+                Err(ApiError::not_found("file not found"))
+            }
+        }
     }
-    stream_file(target, None).await
 }
 
 fn resolve_www_path(root: &Path, request_path: &str) -> ApiResult<PathBuf> {
@@ -412,6 +437,16 @@ fn resolve_www_path(root: &Path, request_path: &str) -> ApiResult<PathBuf> {
         return Err(ApiError::not_found("file not found"));
     }
     Ok(root.join(candidate))
+}
+
+fn should_fallback_to_index(request_path: &str) -> bool {
+    let trimmed = request_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return true;
+    }
+    let candidate = Path::new(trimmed);
+    let has_extension = candidate.extension().is_some();
+    !has_extension
 }
 
 async fn bootstrap(State(state): State<AppState>) -> ApiResult<Json<BootstrapPayload>> {
@@ -520,15 +555,23 @@ async fn download_subtitle(state: AppState, id: String, code: String) -> ApiResu
 
     // Prefer the explicit filesystem path recorded during download, but fall
     // back to the standard `videoid/lang` layout when missing.
-    let path = track.path.map(PathBuf::from).unwrap_or_else(|| {
-        state
-            .files
-            .subtitles
-            .join(&id)
-            .join(format!("{}.{}.vtt", id, code))
-    });
+    let path = if let Some(path) = track.path {
+        let path = PathBuf::from(path);
+        let base = state.files.subtitles.join(&id);
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+            || !path.starts_with(&base)
+        {
+            return Err(ApiError::not_found("subtitle track not found"));
+        }
+        path
+    } else {
+        find_subtitle_file(&state.files.subtitles, &id, &code).await?
+    };
 
-    stream_file(path, Some("text/vtt".parse().unwrap())).await
+    let mime = MimeGuess::from_path(&path).first();
+    stream_file(path, mime, None).await
 }
 
 async fn download_video_thumbnail(
@@ -549,21 +592,23 @@ async fn download_thumbnail(state: AppState, id: String, file: String) -> ApiRes
     ensure_safe_path_segment(&id)?;
     ensure_safe_path_segment(&file)?;
     let path = state.files.thumbnails.join(&id).join(&file);
-    stream_file(path, None).await
+    stream_file(path, None, None).await
 }
 
 async fn stream_video_file(
     State(state): State<AppState>,
     AxumPath((id, format)): AxumPath<(String, String)>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
-    stream_media(state, MediaCategory::Video, id, format).await
+    stream_media(state, MediaCategory::Video, id, format, &headers).await
 }
 
 async fn stream_short_file(
     State(state): State<AppState>,
     AxumPath((id, format)): AxumPath<(String, String)>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
-    stream_media(state, MediaCategory::Short, id, format).await
+    stream_media(state, MediaCategory::Short, id, format, &headers).await
 }
 
 async fn stream_media(
@@ -571,6 +616,7 @@ async fn stream_media(
     category: MediaCategory,
     id: String,
     format: String,
+    headers: &HeaderMap,
 ) -> ApiResult<Response> {
     ensure_safe_path_segment(&id)?;
     ensure_safe_path_segment(&format)?;
@@ -600,6 +646,7 @@ async fn stream_media(
     stream_file(
         path,
         source.mime_type.as_ref().and_then(|mime| mime.parse().ok()),
+        Some(headers),
     )
     .await
 }
@@ -622,11 +669,29 @@ struct BootstrapPayload {
 }
 
 impl AppState {
+    async fn ensure_fresh_cache(&self) -> ApiResult<()> {
+        let version = self
+            .reader
+            .data_version()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+
+        let mut last = self.cache.last_db_version.write();
+        if let Some(previous) = *last {
+            if version != previous {
+                self.cache.clear();
+            }
+        }
+        *last = Some(version);
+        Ok(())
+    }
+
     /// Returns a cached snapshot containing everything the SPA needs to boot
     /// without hitting follow-up endpoints (videos, shorts, subtitles,
     /// comments). The heavy lifting runs in a blocking task because SQLite is a
     /// synchronous API.
     async fn get_bootstrap(&self) -> ApiResult<Arc<BootstrapPayload>> {
+        self.ensure_fresh_cache().await?;
         if let Some(cached) = self.cache.bootstrap.read().clone() {
             return Ok(cached);
         }
@@ -645,7 +710,10 @@ impl AppState {
             .reader
             .list_subtitles()
             .await
-            .map_err(|err| ApiError::internal(err.to_string()))?;
+            .map_err(|err| ApiError::internal(err.to_string()))?
+            .into_iter()
+            .map(sanitize_subtitle_collection)
+            .collect();
         let comments = self
             .reader
             .list_all_comments()
@@ -666,6 +734,7 @@ impl AppState {
     /// Retrieves every video/short record, memoizing both the list and the
     /// individual details map for quick follow-up lookups.
     async fn get_media_list(&self, category: MediaCategory) -> ApiResult<Vec<VideoRecord>> {
+        self.ensure_fresh_cache().await?;
         if let Some(cached) = self.cache.media_list(category).read().clone() {
             return Ok(cached);
         }
@@ -699,6 +768,7 @@ impl AppState {
     /// Loads metadata for a single video or short, preferring the cache before
     /// falling back to SQLite.
     async fn get_media(&self, category: MediaCategory, videoid: &str) -> ApiResult<VideoRecord> {
+        self.ensure_fresh_cache().await?;
         if let Some(record) = self
             .cache
             .media_details(category)
@@ -735,6 +805,7 @@ impl AppState {
     /// Lazy-loads comment threads; we store them keyed by id because comment
     /// payloads are far smaller than video blobs.
     async fn get_comments(&self, videoid: &str) -> ApiResult<Vec<CommentRecord>> {
+        self.ensure_fresh_cache().await?;
         if let Some(cached) = self.cache.comments.read().get(videoid).cloned() {
             return Ok(cached);
         }
@@ -756,6 +827,7 @@ impl AppState {
     /// Provides subtitle metadata if available. Not every video has subtitles
     /// so the API returns an Option.
     async fn get_subtitles(&self, videoid: &str) -> ApiResult<Option<SubtitleCollection>> {
+        self.ensure_fresh_cache().await?;
         if let Some(cached) = self.cache.subtitles.read().get(videoid).cloned() {
             return Ok(Some(cached));
         }
@@ -781,7 +853,21 @@ impl AppState {
 /// download we store files named `{videoid}_{format}` and the format parameter
 /// is the only piece users need to specify.
 fn source_key(source: &VideoSource) -> Option<String> {
-    source.url.rsplit('/').next().map(|value| value.to_owned())
+    let format_id = source.format_id.trim();
+    if format_id.is_empty() {
+        return None;
+    }
+    Some(normalize_format_id(format_id))
+}
+
+fn normalize_format_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '/' | ':' | ' ' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 /// Validates that a single dynamic path segment never escapes its base folder.
@@ -797,18 +883,121 @@ fn ensure_safe_path_segment(value: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn stream_file(path: PathBuf, mime: Option<Mime>) -> ApiResult<Response> {
-    let file = File::open(&path)
+async fn find_subtitle_file(
+    subtitles_root: &Path,
+    id: &str,
+    code: &str,
+) -> ApiResult<PathBuf> {
+    let dir = subtitles_root.join(id);
+    let mut entries = tokio::fs::read_dir(&dir)
+        .await
+        .map_err(|_| ApiError::not_found("subtitle track not found"))?;
+    let prefix = format!("{id}.{code}.");
+    let mut best: Option<(usize, PathBuf)> = None;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| ApiError::not_found("subtitle track not found"))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+        if name.starts_with(&prefix) {
+            let ext = Path::new(&name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("");
+            let rank = subtitle_extension_rank(ext);
+            if rank >= 10 {
+                continue;
+            }
+            match best {
+                Some((best_rank, _)) if rank >= best_rank => {}
+                _ => best = Some((rank, path)),
+            }
+        }
+    }
+    best
+        .map(|(_, path)| path)
+        .ok_or_else(|| ApiError::not_found("subtitle track not found"))
+}
+
+fn subtitle_extension_rank(ext: &str) -> usize {
+    match ext.to_ascii_lowercase().as_str() {
+        "vtt" => 0,
+        "srv3" => 1,
+        "srv2" => 2,
+        "srv1" => 3,
+        "srt" => 4,
+        "ttml" => 5,
+        "xml" => 6,
+        "ass" => 7,
+        _ => 10,
+    }
+}
+
+async fn stream_file(
+    path: PathBuf,
+    mime: Option<Mime>,
+    headers: Option<&HeaderMap>,
+) -> ApiResult<Response> {
+    let mut file = File::open(&path)
         .await
         .map_err(|_| ApiError::not_found("file not found"))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::not_found("file not found"))?;
+    let size = metadata.len();
 
-    // Either use the explicit mime provided by the VideoSource or infer it from
-    // the file extension. Setting CONTENT_TYPE hints allows browsers to stream
-    // video without sniffing.
     let guessed = mime.or_else(|| MimeGuess::from_path(&path).first());
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-    let mut response = body.into_response();
+    let range = headers
+        .and_then(|headers| headers.get(header::RANGE))
+        .and_then(|value| parse_range_header(value, size));
+
+    let mut response = if let Some((start, end)) = range {
+        if start >= size {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                format!("bytes */{}", size).parse().unwrap(),
+            );
+            response
+        } else {
+            let end = end.min(size.saturating_sub(1));
+            let length = end - start + 1;
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(|_| ApiError::not_found("file not found"))?;
+            let stream = ReaderStream::new(file.take(length));
+            let body = Body::from_stream(stream);
+            let mut response = body.into_response();
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                length.to_string().parse().unwrap(),
+            );
+            response
+        }
+    } else {
+        let stream = ReaderStream::new(file);
+        let body = Body::from_stream(stream);
+        body.into_response()
+    };
+
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     if let Some(mime) = guessed
         && let Ok(value) = mime.to_string().parse()
     {
@@ -830,10 +1019,57 @@ fn sanitize_video_record(record: &VideoRecord) -> VideoRecord {
     clone
 }
 
+fn sanitize_subtitle_collection(collection: SubtitleCollection) -> SubtitleCollection {
+    let mut clone = collection;
+    for track in &mut clone.languages {
+        track.path = None;
+    }
+    clone
+}
+
+fn parse_range_header(value: &header::HeaderValue, size: u64) -> Option<(u64, u64)> {
+    let value = value.to_str().ok()?;
+    let value = value.trim();
+    let mut parts = value.split('=');
+    let unit = parts.next()?.trim();
+    if unit != "bytes" {
+        return None;
+    }
+    let range = parts.next()?.trim();
+    if range.is_empty() {
+        return None;
+    }
+    let (start_str, end_str) = range.split_once('-')?;
+
+    if start_str.is_empty() {
+        // Suffix range: "-N" means last N bytes.
+        let suffix_len: u64 = end_str.parse().ok()?;
+        if suffix_len == 0 {
+            return None;
+        }
+        if suffix_len >= size {
+            return Some((0, size.saturating_sub(1)));
+        }
+        return Some((size - suffix_len, size.saturating_sub(1)));
+    }
+
+    let start: u64 = start_str.parse().ok()?;
+    let end = if end_str.is_empty() {
+        size.saturating_sub(1)
+    } else {
+        end_str.parse().ok()?
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::to_bytes, extract::State as AxumState};
+    use axum::http::HeaderMap;
     use libsql::{Builder, params};
     use serde_json::Value;
     use std::{env, path::PathBuf, sync::Arc};
@@ -1073,7 +1309,8 @@ mod tests {
 
         ctx.insert_video("gamma").await;
         let second = ctx.state.get_bootstrap().await.unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second.videos.iter().any(|video| video.videoid == "gamma"));
     }
 
     #[tokio::test]
@@ -1094,7 +1331,7 @@ mod tests {
             .get_media_list(MediaCategory::Video)
             .await
             .unwrap();
-        assert_eq!(cached.len(), 1);
+        assert_eq!(cached.len(), 0);
     }
 
     #[tokio::test]
@@ -1130,12 +1367,12 @@ mod tests {
         assert_eq!(record.videoid, "alpha");
 
         ctx.delete_by_videoid("videos", "alpha").await;
-        let cached = ctx
+        let err = ctx
             .state
             .get_media(MediaCategory::Video, "alpha")
             .await
-            .unwrap();
-        assert_eq!(cached.videoid, "alpha");
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
 
         let err = ctx
             .state
@@ -1165,13 +1402,13 @@ mod tests {
         assert_eq!(first_comments.len(), 1);
         ctx.delete_by_videoid("comments", "alpha").await;
         let cached_comments = ctx.state.get_comments("alpha").await.unwrap();
-        assert_eq!(cached_comments.len(), 1);
+        assert_eq!(cached_comments.len(), 0);
 
         let first_subtitles = ctx.state.get_subtitles("alpha").await.unwrap();
         assert!(first_subtitles.is_some());
         ctx.delete_by_videoid("subtitles", "alpha").await;
         let cached_subtitles = ctx.state.get_subtitles("alpha").await.unwrap();
-        assert!(cached_subtitles.is_some());
+        assert!(cached_subtitles.is_none());
     }
 
     #[tokio::test]
@@ -1260,6 +1497,7 @@ mod tests {
             MediaCategory::Video,
             "alpha".into(),
             "1080p".into(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap();
@@ -1289,6 +1527,7 @@ mod tests {
             MediaCategory::Video,
             "alpha".into(),
             "1080p".into(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap();
@@ -1304,6 +1543,7 @@ mod tests {
             MediaCategory::Video,
             "alpha".into(),
             "4k".into(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap_err();

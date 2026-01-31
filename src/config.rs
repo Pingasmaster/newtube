@@ -19,22 +19,72 @@ pub struct RuntimePaths {
 }
 
 pub fn load_runtime_paths() -> Result<RuntimePaths> {
-    let file_vars = read_env_file(Path::new(DEFAULT_ENV_PATH))?;
-    build_runtime_paths(&file_vars, env_var_string)
+    resolve_runtime_paths(RuntimeOverrides::default())
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOverrides {
+    pub media_root: Option<PathBuf>,
+    pub www_root: Option<PathBuf>,
+    pub newtube_port: Option<u16>,
+    pub newtube_host: Option<String>,
+    pub env_path: Option<PathBuf>,
+}
+
+pub fn resolve_runtime_paths(overrides: RuntimeOverrides) -> Result<RuntimePaths> {
+    let env_path = overrides
+        .env_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_ENV_PATH));
+    let file_vars = read_env_file(env_path)?;
+    build_runtime_paths_with_overrides(&file_vars, env_var_string, overrides)
+}
+
+#[cfg(test)]
 fn build_runtime_paths(
     file_vars: &HashMap<String, String>,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<RuntimePaths> {
-    let media_root = lookup_value("MEDIA_ROOT", file_vars, &env_lookup)
+    build_runtime_paths_with_overrides(
+        file_vars,
+        env_lookup,
+        RuntimeOverrides::default(),
+    )
+}
+
+fn build_runtime_paths_with_overrides(
+    file_vars: &HashMap<String, String>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+    overrides: RuntimeOverrides,
+) -> Result<RuntimePaths> {
+    let media_root = overrides
+        .media_root
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| lookup_value("MEDIA_ROOT", file_vars, &env_lookup))
         .ok_or_else(|| anyhow!("MEDIA_ROOT not set"))?;
-    let www_root = lookup_value("WWW_ROOT", file_vars, &env_lookup)
+    let www_root = overrides
+        .www_root
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| lookup_value("WWW_ROOT", file_vars, &env_lookup))
         .ok_or_else(|| anyhow!("WWW_ROOT not set"))?;
-    let newtube_port = lookup_value("NEWTUBE_PORT", file_vars, &env_lookup)
-        .and_then(|value| value.parse::<u16>().ok())
+    let newtube_port = overrides
+        .newtube_port
+        .or_else(|| {
+            lookup_value("NEWTUBE_PORT", file_vars, &env_lookup)
+                .and_then(|value| value.parse::<u16>().ok())
+        })
         .unwrap_or(DEFAULT_NEWTUBE_PORT);
-    let newtube_host = lookup_value("NEWTUBE_HOST", file_vars, &env_lookup)
+    let newtube_host = overrides
+        .newtube_host
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .or_else(|| lookup_value("NEWTUBE_HOST", file_vars, &env_lookup))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_NEWTUBE_HOST.to_string());
     Ok(RuntimePaths {

@@ -1,5 +1,11 @@
 # Newtube
 
+A youtube frontend clone, entirely written from the gound up in HTML, CSS and javascript to be extra extra fast and almost pixel-perfect with the Youtube UI. Only exceptions are bad UI/UX decisions like the very recent icons and mobile-oriented style. The backend is fully written in safe rust and some bash scripts in order to clone entire youtube channels. When a video from them is first asked by a client, the backend downloads the entire channels videos.
+
+There is no account system, but history and likes/dislikes still work. You can save your cookies via an ID which contains your likes/dislikes/playlists/history and is unique to you so you can erase your cookies and still have the same experience on all your devices. There is also no ad. It also is not in violation of youtube copyright as all icons are taken from material UI and open-licensed, and it does NOT serve videos from youtube directly or indirectly, therefore there is no violation of youtube's TOS as this makes NO calls to youtube.com or any google-owned subdomains.
+
+The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
+
 ## Docker Compose (recommended)
 
 This is the recommended method to serve the web UI and have the complete software stack.
@@ -9,6 +15,17 @@ This is the recommended method to serve the web UI and have the complete softwar
    ```bash
    docker compose up -d
    ```
+
+This brings up:
+- `backend`: serves the UI + API on port 8080.
+- `routine_update`: runs `routine_update` in a loop for periodic refreshes.
+- `downloader` (profile `manual`): on-demand channel downloads.
+
+Download a channel via compose:
+
+```bash
+docker compose run --rm downloader https://www.youtube.com/@LinusTechTips
+```
 
 After the `.env` is set, `docker compose up -d` is the only command you need.
 
@@ -27,13 +44,7 @@ EOF
 
 The compose stack serves the SPA + `/api/*` on port 8080 and keeps channels fresh in the background.
 
-Admin settings live at `/admin` (no auth by default; protect it with your reverse proxy if needed).
-
-A youtube frontend clone, entirely written from the gound up in HTML, CSS and javascript to be extra extra fast and almost pixel-perfect with the Youtube UI. Only exceptions are bad UI/UX decisions like the very recent icons and mobile-oriented style. The backend is fully written in safe rust and some bash scripts in order to clone entire youtube channels. When a video from them is first asked by a client, the backend downloads the entire channels videos.
-
-There is no account system, but history and likes/dislikes still work. You can save your cookies via an ID which contains your likes/dislikes/playlists/history and is unique to you so you can erase your cookies and still have the same experience on all your devices. There is also no ad. It also is not in violation of youtube copyright as all icons are taken from material UI and open-licensed, and it does NOT serve videos from youtube directly or indirectly, therefore there is no violation of youtube's TOS as this makes NO calls to youtube.com or any google-owned subdomains.
-
-The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
+Admin settings live at `/admin` (no auth by default; please protect it with your reverse proxy).
 
 ## Install (manual / old school)
 
@@ -85,39 +96,6 @@ newtube-routine
 ```
 
 Schedule `newtube-routine` with cron/systemd if you want nightly content refreshes.
-
-## Docker (single container)
-
-Build and run:
-
-```bash
-docker build -t newtube .
-docker run --rm -p 8080:8080 -v /srv/newtube/media:/data/media newtube
-```
-
-Notes:
-- The image bundles the static web UI; only the media library needs a volume.
-- The container runs as a non-root user (uid 10001). Ensure the media volume is readable by that uid.
-- To override settings, mount your own `.env` at `/app/.env` or pass environment variables.
-
-## Docker Compose (details / extras)
-
-A `docker-compose.yml` is included. With a `.env` in this folder:
-
-```bash
-docker compose up -d
-```
-
-This brings up:
-- `backend`: serves the UI + API on port 8080.
-- `routine_update`: runs `routine_update` in a loop for periodic refreshes.
-- `downloader` (profile `manual`): on-demand channel downloads.
-
-Download a channel via compose:
-
-```bash
-docker compose run --rm downloader https://www.youtube.com/@LinusTechTips
-```
 
 ## Reverse proxy examples
 
@@ -213,3 +191,17 @@ Before runing any tests, you need to run `npm install` to install modules.
 `npm run test:coverage` : même suite Jest que ci-dessus mais enregistre un rapport HTML/LCOV sous `coverage/jest`
 
 `npm run test:e2e` : launches Cypress on port 4173. It now covers **both** `cypress/e2e/home.cy.js` (home grid + sidebar states per desktop/tablet/mobile rules from `cypress/fixtures/bootstrap.json`) and `cypress/e2e/watch.cy.js` (video player metadata, comments rendering and like/dislike/subscription toggles with mocked API responses)
+
+# CI workflows
+
+## GitHub Actions
+
+- `.github/workflows/ci.yml` runs on pushes to `main`/`dev` and on pull requests. It uses `ubuntu-latest`, checks Rust formatting, runs `cargo check`, `cargo clippy`, and `cargo test`, then runs the frontend suite with `npm run test`, `npm run test:coverage`, and `npm run test:e2e`. Jest coverage is uploaded as an artifact.
+- `.github/workflows/security.yml` runs on a weekly schedule (Monday 02:00 UTC) or via manual dispatch. It performs `npm audit`, `cargo audit`, and a Trivy filesystem scan, and uploads the Trivy report artifact.
+- Tooling is sourced via GitHub Actions (checkout, cache, setup-node, upload-artifact), and Node is pinned to the latest release via `node-version: node`.
+
+## GitLab CI
+
+- `.gitlab-ci.yml` mirrors the GitHub workflows with `test` and `security` stages. `backend` and `frontend` run for merge requests and on pushes to `main`/`dev`, using the same Rust checks and npm test commands and keeping the Jest coverage as an artifact.
+- Security jobs (`npm_audit`, `cargo_audit`, `trivy_scan`) run only on scheduled or manually-triggered pipelines and produce the same audit outputs, including the Trivy report artifact.
+- GitLab uses explicit container images (`rust:latest`, `node:latest`, `cypress/included:latest`, `aquasec/trivy:latest`) rather than GitHub-hosted runners.

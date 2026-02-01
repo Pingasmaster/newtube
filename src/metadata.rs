@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Metadata persistence layer for NewTube. Mainly used for backend tests.
 //!
 //! All structs in this module mirror how metadata is serialized to disk and
@@ -662,6 +664,7 @@ fn row_to_comment(row: &Row) -> Result<CommentRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -1043,6 +1046,146 @@ mod tests {
         assert_eq!(all[0].id, "1");
         assert_eq!(all[1].id, "2");
         assert_eq!(all[2].id, "3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_creates_parent_dirs_and_reopens() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("nested/metadata/db.sqlite");
+        let _store = MetadataStore::open(&path).await?;
+        assert!(path.exists());
+        assert!(path.parent().unwrap().exists());
+        let _reopened = MetadataStore::open(&path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_videos_orders_by_date_then_rowid() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+
+        let mut first = sample_video("first");
+        first.upload_date = Some("2024-01-01".into());
+        store.upsert_video(&first).await?;
+
+        let mut second = sample_video("second");
+        second.upload_date = Some("2024-01-01".into());
+        store.upsert_video(&second).await?;
+
+        let mut no_date = sample_video("no-date");
+        no_date.upload_date = None;
+        store.upsert_video(&no_date).await?;
+
+        let videos = reader.list_videos().await?;
+        assert_eq!(videos.len(), 3);
+        assert_eq!(videos[0].videoid, "second");
+        assert_eq!(videos[1].videoid, "first");
+        assert_eq!(videos[2].videoid, "no-date");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_comments_with_empty_slice_clears_entries() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+        store.upsert_video(&sample_video("vid")).await?;
+        store
+            .replace_comments("vid", &[sample_comment("c1", "vid")])
+            .await?;
+        assert_eq!(reader.get_comments("vid").await?.len(), 1);
+
+        store.replace_comments("vid", &[]).await?;
+        assert!(reader.get_comments("vid").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_comments_rolls_back_on_duplicate_ids() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+        store.upsert_video(&sample_video("vid")).await?;
+        store
+            .replace_comments("vid", &[sample_comment("keep", "vid")])
+            .await?;
+
+        let mut dup1 = sample_comment("dup", "vid");
+        let dup2 = sample_comment("dup", "vid");
+        dup1.text = "first".into();
+        let err = store.replace_comments("vid", &[dup1, dup2]).await;
+        assert!(err.is_err());
+
+        let comments = reader.get_comments("vid").await?;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "keep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comments_queries_ignore_orphaned_video_ids() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+        store
+            .replace_comments("ghost", &[sample_comment("c1", "ghost")])
+            .await?;
+
+        assert!(reader.get_comments("ghost").await?.is_empty());
+        assert!(reader.list_all_comments().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_video_allows_empty_collections_and_null_extras() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+
+        let record = VideoRecord {
+            videoid: "empty".into(),
+            title: "Empty".into(),
+            description: String::new(),
+            likes: None,
+            dislikes: None,
+            views: None,
+            upload_date: None,
+            author: None,
+            subscriber_count: None,
+            duration: None,
+            duration_text: None,
+            channel_url: None,
+            thumbnail_url: None,
+            tags: Vec::new(),
+            thumbnails: Vec::new(),
+            extras: Value::Null,
+            sources: Vec::new(),
+        };
+
+        store.upsert_video(&record).await?;
+        let fetched = reader.get_video("empty").await?.expect("video exists");
+        assert!(fetched.tags.is_empty());
+        assert!(fetched.thumbnails.is_empty());
+        assert!(fetched.sources.is_empty());
+        assert_eq!(fetched.extras, Value::Null);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_subtitles_allows_empty_languages() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+        store.upsert_video(&sample_video("vid")).await?;
+
+        let subtitles = SubtitleCollection {
+            videoid: "vid".into(),
+            languages: Vec::new(),
+        };
+        store.upsert_subtitles(&subtitles).await?;
+
+        let fetched = reader.get_subtitles("vid").await?.expect("subtitles exist");
+        assert!(fetched.languages.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_version_changes_after_writes() -> Result<()> {
+        let (_temp, store, reader, _path) = create_store().await?;
+        let before = reader.data_version().await?;
+        store.upsert_video(&sample_video("alpha")).await?;
+        let after = reader.data_version().await?;
+        assert_ne!(before, after);
         Ok(())
     }
 }

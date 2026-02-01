@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{Context, Result, anyhow};
 use std::{
     collections::HashMap,
@@ -147,6 +149,7 @@ pub fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -208,5 +211,95 @@ mod tests {
         })
         .unwrap();
         assert_eq!(runtime.media_root, PathBuf::from("/env"));
+    }
+
+    #[test]
+    fn read_env_file_handles_export_and_quotes() {
+        let cfg = make_config(
+            r#"
+            export MEDIA_ROOT="/media"
+            WWW_ROOT='/www'
+            NEWTUBE_HOST =  "0.0.0.0"
+            NEWTUBE_PORT=9090
+            # comment
+            INVALID_LINE
+            "#,
+        );
+        let vars = read_env_file(cfg.path()).unwrap();
+        assert_eq!(vars.get("MEDIA_ROOT").unwrap(), "/media");
+        assert_eq!(vars.get("WWW_ROOT").unwrap(), "/www");
+        assert_eq!(vars.get("NEWTUBE_HOST").unwrap(), "0.0.0.0");
+        assert_eq!(vars.get("NEWTUBE_PORT").unwrap(), "9090");
+        assert!(!vars.contains_key("INVALID_LINE"));
+    }
+
+    #[test]
+    fn read_env_file_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = read_env_file(&dir.path().join("missing.env")).unwrap();
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn build_runtime_paths_override_precedence() {
+        let mut vars = HashMap::new();
+        vars.insert("MEDIA_ROOT".to_string(), "/file-media".to_string());
+        vars.insert("WWW_ROOT".to_string(), "/file-www".to_string());
+        vars.insert("NEWTUBE_HOST".to_string(), "file-host".to_string());
+        vars.insert("NEWTUBE_PORT".to_string(), "7000".to_string());
+
+        let overrides = RuntimeOverrides {
+            media_root: Some(PathBuf::from("/override-media")),
+            www_root: None,
+            newtube_port: Some(9000),
+            newtube_host: Some("override-host".into()),
+            env_path: None,
+        };
+
+        let runtime = build_runtime_paths_with_overrides(
+            &vars,
+            |key| {
+                if key == "WWW_ROOT" {
+                    Some("/env-www".to_string())
+                } else if key == "NEWTUBE_PORT" {
+                    Some("8000".to_string())
+                } else {
+                    None
+                }
+            },
+            overrides,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.media_root, PathBuf::from("/override-media"));
+        assert_eq!(runtime.www_root, PathBuf::from("/env-www"));
+        assert_eq!(runtime.newtube_port, 9000);
+        assert_eq!(runtime.newtube_host, "override-host");
+    }
+
+    #[test]
+    fn build_runtime_paths_ignores_blank_host() {
+        let vars =
+            read_env_file(make_config("MEDIA_ROOT=\"/m\"\nWWW_ROOT=\"/w\"\n").path()).unwrap();
+        let runtime = build_runtime_paths_with_overrides(
+            &vars,
+            |_| None,
+            RuntimeOverrides {
+                newtube_host: Some("   ".into()),
+                ..RuntimeOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.newtube_host, DEFAULT_NEWTUBE_HOST);
+    }
+
+    #[test]
+    fn build_runtime_paths_invalid_port_defaults() {
+        let vars = read_env_file(
+            make_config("MEDIA_ROOT=\"/m\"\nWWW_ROOT=\"/w\"\nNEWTUBE_PORT=\"nope\"\n").path(),
+        )
+        .unwrap();
+        let runtime = build_runtime_paths(&vars, |_| None).unwrap();
+        assert_eq!(runtime.newtube_port, DEFAULT_NEWTUBE_PORT);
     }
 }

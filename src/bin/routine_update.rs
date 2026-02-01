@@ -387,6 +387,7 @@ fn find_download_channel_executable() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::env;
     use std::io::Write;
     use std::sync::Mutex;
@@ -491,5 +492,57 @@ mod tests {
         let path = find_download_channel_executable()?;
         assert_eq!(path, fake);
         Ok(())
+    }
+
+    #[test]
+    fn extract_channel_url_falls_back_to_uploader_url() -> Result<()> {
+        let temp = tempdir()?;
+        let file_path = temp.path().join("a.info.json");
+        File::create(&file_path)?.write_all(br#"{"uploader_url":"https://uploader"}"#)?;
+        let url = extract_channel_url(&file_path)?.expect("url parsed");
+        assert_eq!(url, "https://uploader");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_channel_url_uses_creator_entries() -> Result<()> {
+        let temp = tempdir()?;
+        let file_path = temp.path().join("b.info.json");
+        File::create(&file_path)?
+            .write_all(br#"{"creators":[{"url":"https://creator.example"}]}"#)?;
+        let url = extract_channel_url(&file_path)?.expect("url parsed");
+        assert_eq!(url, "https://creator.example");
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalize_channel_url_strips_query_and_fragment() {
+        assert_eq!(
+            canonicalize_channel_url("HTTPS://Example.com/Channel/?q=1#frag"),
+            "https://example.com/channel"
+        );
+    }
+
+    #[test]
+    fn collect_channels_ignores_invalid_entries() -> Result<()> {
+        let temp = tempdir()?;
+        let videos_dir = temp.path().join("videos");
+        fs::create_dir_all(&videos_dir)?;
+        fs::write(videos_dir.join("not_info.json"), br#"{"channel_url":"x"}"#)?;
+        fs::write(videos_dir.join("bad.info.json"), br#"{bad json}"#)?;
+        let mut map = BTreeMap::new();
+        collect_channels(&videos_dir, &mut map)?;
+        assert!(map.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn routine_args_rejects_unknown_flags() {
+        with_env_file(
+            &[("MEDIA_ROOT", "/yt"), ("WWW_ROOT", "/www/newtube.com")],
+            || {
+                assert!(RoutineArgs::from_slice(&["--unknown"]).is_err());
+            },
+        );
     }
 }

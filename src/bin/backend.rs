@@ -1564,7 +1564,50 @@ fn parse_media_kind(value: Option<&str>) -> MediaCategory {
     }
 }
 
+#[cfg(test)]
+static DOWNLOAD_CHANNEL_STUB: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static YT_DLP_STUB: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct StubGuard {
+    slot: &'static std::sync::Mutex<Option<PathBuf>>,
+}
+
+#[cfg(test)]
+impl Drop for StubGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_download_channel_stub(path: PathBuf) -> StubGuard {
+    *DOWNLOAD_CHANNEL_STUB.lock().unwrap() = Some(path);
+    StubGuard {
+        slot: &DOWNLOAD_CHANNEL_STUB,
+    }
+}
+
+#[cfg(test)]
+fn set_ytdlp_stub(path: PathBuf) -> StubGuard {
+    *YT_DLP_STUB.lock().unwrap() = Some(path);
+    StubGuard { slot: &YT_DLP_STUB }
+}
+
 fn find_download_channel_executable() -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(path) = DOWNLOAD_CHANNEL_STUB.lock().unwrap().clone()
+            && path.exists()
+        {
+            return Ok(path);
+        }
+    }
+
     if let Ok(path) = std::env::var("NEWTUBE_DOWNLOAD_BIN") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
@@ -1714,9 +1757,19 @@ fn video_url_for_kind(video_id: &str, kind: MediaCategory) -> String {
     }
 }
 
+fn yt_dlp_command() -> std::process::Command {
+    #[cfg(test)]
+    {
+        if let Some(path) = YT_DLP_STUB.lock().unwrap().clone() {
+            return std::process::Command::new(path);
+        }
+    }
+    std::process::Command::new("yt-dlp")
+}
+
 fn resolve_channel_url(video_id: &str, kind: MediaCategory) -> Result<String> {
     let video_url = video_url_for_kind(video_id, kind);
-    let output = std::process::Command::new("yt-dlp")
+    let output = yt_dlp_command()
         .arg("--dump-single-json")
         .arg("--skip-download")
         .arg("--no-warnings")
@@ -1738,13 +1791,17 @@ fn resolve_channel_url(video_id: &str, kind: MediaCategory) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Json;
     use axum::http::HeaderMap;
     use axum::{body::to_bytes, extract::State as AxumState};
     use libsql::{Builder, params};
     use serde_json::Value;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
-    use std::{env, path::PathBuf, sync::Arc};
+    use std::{env, fs, path::PathBuf, sync::Arc};
     use tempfile::tempdir;
+    use tokio::time::{Duration, sleep};
 
     struct BackendTestContext {
         _temp: tempfile::TempDir,
@@ -1837,6 +1894,35 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    fn install_stub(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    async fn wait_for_terminal_status(
+        downloads: &DownloadManager,
+        job_id: &str,
+    ) -> DownloadJobStatus {
+        for _ in 0..80 {
+            if let Some(status) = downloads.get_status(job_id)
+                && (status.status == "completed" || status.status == "failed")
+            {
+                return status;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        downloads
+            .get_status(job_id)
+            .expect("download status available")
     }
 
     fn sample_video(id: &str) -> VideoRecord {
@@ -2242,5 +2328,330 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["error"], "missing");
+    }
+
+    #[test]
+    fn parse_range_header_handles_variants() {
+        let size = 10;
+        let value = header::HeaderValue::from_static("bytes=0-4");
+        assert_eq!(parse_range_header(&value, size), Some((0, 4)));
+
+        let value = header::HeaderValue::from_static("bytes=5-");
+        assert_eq!(parse_range_header(&value, size), Some((5, 9)));
+
+        let value = header::HeaderValue::from_static("bytes=-3");
+        assert_eq!(parse_range_header(&value, size), Some((7, 9)));
+
+        let value = header::HeaderValue::from_static("bytes=-0");
+        assert_eq!(parse_range_header(&value, size), None);
+
+        let value = header::HeaderValue::from_static("items=0-1");
+        assert_eq!(parse_range_header(&value, size), None);
+
+        let value = header::HeaderValue::from_static("bytes=7-5");
+        assert_eq!(parse_range_header(&value, size), None);
+    }
+
+    #[tokio::test]
+    async fn stream_file_respects_ranges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, header::HeaderValue::from_static("bytes=1-3"));
+        let response = stream_file(path.clone(), None, Some(&headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 1-3/6"
+        );
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "3");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"bcd");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, header::HeaderValue::from_static("bytes=-2"));
+        let response = stream_file(path.clone(), None, Some(&headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"ef");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RANGE,
+            header::HeaderValue::from_static("bytes=10-20"),
+        );
+        let response = stream_file(path, None, Some(&headers)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */6"
+        );
+    }
+
+    #[test]
+    fn ensure_safe_path_segment_rejects_invalid() {
+        assert!(ensure_safe_path_segment("").is_err());
+        assert!(ensure_safe_path_segment("..").is_err());
+        assert!(ensure_safe_path_segment("../secret").is_err());
+        assert!(ensure_safe_path_segment("dir/../file").is_err());
+        assert!(ensure_safe_path_segment("dir/file").is_ok());
+        assert!(ensure_safe_path_segment("safe.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn find_subtitle_file_picks_best_extension() {
+        let dir = tempdir().unwrap();
+        let subtitle_dir = dir.path().join("alpha");
+        fs::create_dir_all(&subtitle_dir).unwrap();
+        fs::write(subtitle_dir.join("alpha.en.srt"), "SRT").unwrap();
+        fs::write(subtitle_dir.join("alpha.en.vtt"), "VTT").unwrap();
+        fs::write(subtitle_dir.join("alpha.en.SRV3"), "SRV3").unwrap();
+        fs::write(subtitle_dir.join("alpha.en.foo"), "foo").unwrap();
+
+        let path = find_subtitle_file(dir.path(), "alpha", "en").await.unwrap();
+        assert!(path.ends_with("alpha.en.vtt"));
+    }
+
+    #[tokio::test]
+    async fn find_subtitle_file_ignores_unknown_extensions() {
+        let dir = tempdir().unwrap();
+        let subtitle_dir = dir.path().join("alpha");
+        fs::create_dir_all(&subtitle_dir).unwrap();
+        fs::write(subtitle_dir.join("alpha.en.foo"), "foo").unwrap();
+
+        let err = find_subtitle_file(dir.path(), "alpha", "en").await;
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn source_key_sanitizes_format_ids() {
+        let source = VideoSource {
+            format_id: "http/1080p:60".into(),
+            quality_label: None,
+            width: None,
+            height: None,
+            fps: None,
+            mime_type: None,
+            ext: None,
+            file_size: None,
+            url: "/api/videos/alpha/streams/http_1080p_60".into(),
+            path: None,
+        };
+        assert_eq!(source_key(&source).as_deref(), Some("http_1080p_60"));
+
+        let empty = VideoSource {
+            format_id: "   ".into(),
+            url: "/api/videos/alpha/streams/none".into(),
+            ..source
+        };
+        assert!(source_key(&empty).is_none());
+    }
+
+    #[test]
+    fn resolve_www_path_and_index_fallbacks() {
+        let root = tempdir().unwrap();
+        let root_path = root.path();
+        let index = root_path.join("index.html");
+        assert_eq!(resolve_www_path(root_path, "/").unwrap(), index);
+
+        let resolved = resolve_www_path(root_path, "/assets/app.js").unwrap();
+        assert_eq!(resolved, root_path.join("assets/app.js"));
+
+        assert!(resolve_www_path(root_path, "/../secret").is_err());
+
+        assert!(should_fallback_to_index("/"));
+        assert!(should_fallback_to_index("/watch/abc"));
+        assert!(!should_fallback_to_index("/app.js"));
+    }
+
+    #[test]
+    fn settings_store_defaults_and_update_persist() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(SETTINGS_FILE);
+        fs::write(&settings_path, "not json").unwrap();
+
+        let defaults = InstanceSettings {
+            missing_media_behavior: MissingMediaBehavior::Prompt,
+        };
+        let store = SettingsStore::load(dir.path(), defaults.clone());
+        assert_eq!(
+            store.get().missing_media_behavior,
+            MissingMediaBehavior::Prompt
+        );
+
+        let updated = InstanceSettings {
+            missing_media_behavior: MissingMediaBehavior::NotFound,
+        };
+        let stored = store.update(updated.clone()).unwrap();
+        assert_eq!(
+            stored.missing_media_behavior,
+            MissingMediaBehavior::NotFound
+        );
+
+        let raw = fs::read_to_string(&settings_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["missingMediaBehavior"], "not_found");
+        assert!(!settings_path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn missing_media_behavior_parses_aliases() {
+        assert_eq!(
+            MissingMediaBehavior::parse("404"),
+            Some(MissingMediaBehavior::NotFound)
+        );
+        assert_eq!(
+            MissingMediaBehavior::parse("not_found"),
+            Some(MissingMediaBehavior::NotFound)
+        );
+        assert_eq!(
+            MissingMediaBehavior::parse("notfound"),
+            Some(MissingMediaBehavior::NotFound)
+        );
+        assert_eq!(
+            MissingMediaBehavior::parse("prompt"),
+            Some(MissingMediaBehavior::Prompt)
+        );
+        assert_eq!(
+            MissingMediaBehavior::parse("download"),
+            Some(MissingMediaBehavior::Prompt)
+        );
+        assert_eq!(
+            MissingMediaBehavior::parse("ask"),
+            Some(MissingMediaBehavior::Prompt)
+        );
+        assert_eq!(MissingMediaBehavior::parse("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn settings_handlers_roundtrip() {
+        let ctx = BackendTestContext::new().await;
+        let payload = InstanceSettings {
+            missing_media_behavior: MissingMediaBehavior::Prompt,
+        };
+        let Json(updated) = update_settings(AxumState(ctx.state.clone()), Json(payload))
+            .await
+            .unwrap();
+        assert_eq!(updated.missing_media_behavior, MissingMediaBehavior::Prompt);
+
+        let Json(current) = get_settings(AxumState(ctx.state.clone())).await.unwrap();
+        assert_eq!(current.missing_media_behavior, MissingMediaBehavior::Prompt);
+    }
+
+    #[tokio::test]
+    async fn download_subtitle_rejects_invalid_paths() {
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
+
+        let outside = tempdir().unwrap();
+        ctx.insert_subtitles(
+            "alpha",
+            vec![SubtitleTrack {
+                code: "en".into(),
+                name: "English".into(),
+                url: "/api/videos/alpha/subtitles/en".into(),
+                path: Some(
+                    outside
+                        .path()
+                        .join("evil.vtt")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            }],
+        )
+        .await;
+
+        let err = download_subtitle(ctx.state.clone(), "alpha".into(), "en".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn download_subtitle_missing_track_returns_404() {
+        let mut ctx = BackendTestContext::new().await;
+        ctx.insert_video("alpha").await;
+        ctx.insert_subtitles(
+            "alpha",
+            vec![SubtitleTrack {
+                code: "en".into(),
+                name: "English".into(),
+                url: "/api/videos/alpha/subtitles/en".into(),
+                path: None,
+            }],
+        )
+        .await;
+
+        let err = download_subtitle(ctx.state.clone(), "alpha".into(), "fr".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn download_manager_reports_success_and_failure() {
+        let dir = tempdir().unwrap();
+
+        let success_script = "#!/usr/bin/env bash\nexit 0\n";
+        let success_bin = install_stub(dir.path(), "download_channel", success_script);
+        let _success_guard = set_download_channel_stub(success_bin);
+
+        let downloads = DownloadManager::new(dir.path().to_path_buf(), dir.path().join("www"));
+        let job_id = downloads
+            .start_video_download("alpha".into(), MediaCategory::Video)
+            .unwrap();
+        let status = wait_for_terminal_status(&downloads, &job_id).await;
+        assert_eq!(status.status, "completed");
+        let progress_path = dir
+            .path()
+            .join(DOWNLOADS_DIR)
+            .join(format!("{job_id}.json"));
+        assert!(progress_path.exists());
+
+        let fail_script = "#!/usr/bin/env bash\nexit 1\n";
+        let fail_bin = install_stub(dir.path(), "download_channel_fail", fail_script);
+        let _fail_guard = set_download_channel_stub(fail_bin);
+        let failing = DownloadManager::new(dir.path().to_path_buf(), dir.path().join("www"));
+        let fail_id = failing
+            .start_video_download("beta".into(), MediaCategory::Video)
+            .unwrap();
+        let fail_status = wait_for_terminal_status(&failing, &fail_id).await;
+        assert_eq!(fail_status.status, "failed");
+        assert_eq!(fail_status.progress, 100);
+    }
+
+    #[tokio::test]
+    async fn download_manager_handles_channel_lookup_failure() {
+        let dir = tempdir().unwrap();
+
+        let success_script = "#!/usr/bin/env bash\nexit 0\n";
+        let success_bin = install_stub(dir.path(), "download_channel", success_script);
+        let _download_guard = set_download_channel_stub(success_bin);
+
+        let stub_dir = dir.path().join("ytstub");
+        fs::create_dir_all(&stub_dir).unwrap();
+        let yt_stub = install_stub(&stub_dir, "yt-dlp", "#!/usr/bin/env bash\nexit 1\n");
+        let _yt_guard = set_ytdlp_stub(yt_stub);
+
+        let downloads = DownloadManager::new(dir.path().to_path_buf(), dir.path().join("www"));
+        let job_id = downloads
+            .start_channel_download("alpha".into(), MediaCategory::Video)
+            .unwrap();
+        let status = wait_for_terminal_status(&downloads, &job_id).await;
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.progress, 100);
+    }
+
+    #[test]
+    fn parse_host_and_port_validate_inputs() {
+        assert!(parse_host_arg("not-an-ip").is_err());
+        assert!(parse_port_arg("70000").is_err());
+        assert_eq!(parse_port_arg("0").unwrap(), 0);
     }
 }

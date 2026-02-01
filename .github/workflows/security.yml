@@ -10,12 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6-beta
+        uses: actions/checkout@v6
 
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: node
           cache: npm
 
       - name: Install npm dependencies
@@ -47,7 +47,7 @@ jobs:
           output: trivy-report.txt
 
       - name: Upload Trivy report
-        uses: actions/upload-artifact@v5.0.0
+        uses: actions/upload-artifact@v6
         with:
           name: trivy-report
           path: trivy-report.txt

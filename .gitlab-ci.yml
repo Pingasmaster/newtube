@@ -1,0 +1,97 @@
+stages:
+  - test
+  - security
+
+.test_rules: &test_rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev"'
+
+.security_rules: &security_rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+backend:
+  stage: test
+  image: rust:latest
+  <<: *test_rules
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key: "cargo-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/registry
+      - .cargo/git
+      - target
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt -- --check
+    - cargo check --all-targets --all-features
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo test --all-features
+
+frontend:
+  stage: test
+  image: cypress/included:latest
+  <<: *test_rules
+  variables:
+    NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.npm"
+  cache:
+    key: "npm-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .npm
+  script:
+    - npm ci
+    - npm run test
+    - npm run test:coverage
+    - npm run test:e2e
+  artifacts:
+    name: coverage-jest
+    paths:
+      - coverage/jest
+
+npm_audit:
+  stage: security
+  image: node:latest
+  <<: *security_rules
+  variables:
+    NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.npm"
+  cache:
+    key: "npm-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .npm
+  script:
+    - npm ci
+    - npm audit --production --audit-level=high
+
+cargo_audit:
+  stage: security
+  image: rust:latest
+  <<: *security_rules
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key: "cargo-audit-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/bin
+      - .cargo/registry
+      - .cargo/git
+  script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - cargo install cargo-audit --locked
+    - cargo audit
+
+trivy_scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  <<: *security_rules
+  script:
+    - trivy fs --severity CRITICAL,HIGH --ignore-unfixed --hide-progress --format table --output trivy-report.txt .
+  artifacts:
+    name: trivy-report
+    paths:
+      - trivy-report.txt
+    when: always

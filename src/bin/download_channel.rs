@@ -2175,6 +2175,66 @@ mod tests {
         assert!(args.channel_url.is_none());
     }
 
+    #[test]
+    fn downloader_args_rejects_invalid_inputs() {
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", DEFAULT_MEDIA_ROOT),
+                ("WWW_ROOT", DEFAULT_WWW_ROOT),
+            ],
+            || {
+                assert!(DownloaderArgs::from_slice(&["--unknown"]).is_err());
+                assert!(DownloaderArgs::from_slice(&["--media-kind", "video"]).is_err());
+                assert!(
+                    DownloaderArgs::from_slice(&[
+                        "--video-id",
+                        "abc123",
+                        "https://www.youtube.com/@Channel"
+                    ])
+                    .is_err()
+                );
+                assert!(
+                    DownloaderArgs::from_slice(&[
+                        "https://www.youtube.com/@One",
+                        "https://www.youtube.com/@Two"
+                    ])
+                    .is_err()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn downloader_args_supports_double_dash_and_progress_file() {
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", DEFAULT_MEDIA_ROOT),
+                ("WWW_ROOT", DEFAULT_WWW_ROOT),
+            ],
+            || {
+                parsed = Some(
+                    DownloaderArgs::from_slice(&[
+                        "--progress-file",
+                        "/tmp/progress.json",
+                        "--",
+                        "https://www.youtube.com/@Channel",
+                    ])
+                    .unwrap(),
+                );
+            },
+        );
+        let args = parsed.unwrap();
+        assert_eq!(
+            args.channel_url.as_deref(),
+            Some("https://www.youtube.com/@Channel")
+        );
+        assert_eq!(
+            args.progress_file,
+            Some(PathBuf::from("/tmp/progress.json"))
+        );
+    }
+
     fn sample_video_info() -> VideoInfo {
         VideoInfo {
             title: Some("Sample Title".into()),
@@ -2521,6 +2581,89 @@ exit 0
     }
 
     #[test]
+    fn subtitle_name_map_prefers_manual_over_auto() {
+        let mut info = sample_video_info();
+        let mut subs = HashMap::new();
+        subs.insert(
+            "en".into(),
+            vec![SubtitleInfo {
+                url: None,
+                name: Some("English".into()),
+            }],
+        );
+        info.subtitles = Some(subs);
+
+        let mut auto = HashMap::new();
+        auto.insert(
+            "en".into(),
+            vec![SubtitleInfo {
+                url: None,
+                name: Some("Auto English".into()),
+            }],
+        );
+        auto.insert(
+            "es".into(),
+            vec![SubtitleInfo {
+                url: None,
+                name: Some("Espanol".into()),
+            }],
+        );
+        info.automatic_captions = Some(auto);
+
+        let map = subtitle_name_map(&info);
+        assert_eq!(map.get("en").map(String::as_str), Some("English"));
+        assert_eq!(map.get("es").map(String::as_str), Some("Espanol"));
+    }
+
+    #[test]
+    fn collect_thumbnails_sorts_and_skips_dirs() -> Result<()> {
+        let (_temp, paths) = temp_paths();
+        fs::create_dir_all(paths.thumbnails.join("vid"))?;
+        fs::write(paths.thumbnails.join("vid").join("b.jpg"), "b")?;
+        fs::write(paths.thumbnails.join("vid").join("a.jpg"), "a")?;
+        fs::create_dir_all(paths.thumbnails.join("vid").join("nested"))?;
+
+        let thumbs = collect_thumbnails("vid", &paths, "videos")?;
+        assert_eq!(
+            thumbs,
+            vec![
+                "/api/videos/vid/thumbnails/a.jpg",
+                "/api/videos/vid/thumbnails/b.jpg"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_sources_skips_missing_files() -> Result<()> {
+        let (_temp, paths) = temp_paths();
+        let base = paths.media_dir(MediaKind::Video).join("abc");
+        fs::create_dir_all(&base)?;
+        let mut info = sample_video_info();
+        info.formats = Some(vec![sample_format("1080p", "mp4")]);
+
+        let sources = collect_sources("abc", &info, paths.media_dir(MediaKind::Video), "videos")?;
+        assert!(sources.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn collect_sources_from_disk_filters_unwanted_files() -> Result<()> {
+        let (_temp, paths) = temp_paths();
+        let base = paths.media_dir(MediaKind::Video).join("abc");
+        fs::create_dir_all(&base)?;
+        fs::write(base.join("abc_audio.m4a"), "audio")?;
+        fs::write(base.join("abc_720p.mp4.part"), "partial")?;
+        fs::write(base.join("abc_720p.mp4"), "video")?;
+
+        let info = sample_video_info();
+        let sources = collect_sources("abc", &info, paths.media_dir(MediaKind::Video), "videos")?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].format_id, "720p");
+        Ok(())
+    }
+
+    #[test]
     fn format_helpers_cover_edge_cases() {
         assert_eq!(
             format_quality_label(Some(2160), Some("HDR")),
@@ -2644,6 +2787,63 @@ exit 0
             .join("alpha")
             .join("alpha_1080p.mp4");
         assert!(media_file.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_collection_writes_shorts() -> Result<()> {
+        let (temp, paths) = temp_paths();
+        let stub = install_ytdlp_stub(temp.path())?;
+        let _guard = set_ytdlp_stub_path(stub);
+        paths.prepare()?;
+        let metadata = MetadataStore::open(&paths.metadata_db).await?;
+        let mut archive = HashSet::new();
+
+        download_collection(
+            "shorts",
+            "https://example.com/channel/shorts".to_string(),
+            Some("original_url*=/shorts/"),
+            &paths,
+            &mut archive,
+            MediaKind::Short,
+            &metadata,
+        )
+        .await?;
+
+        let reader = MetadataReader::new(&paths.metadata_db).await?;
+        assert!(reader.get_short("alpha").await?.is_some());
+        let media_file = paths
+            .media_dir(MediaKind::Short)
+            .join("alpha")
+            .join("alpha_1080p.mp4");
+        assert!(media_file.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_collection_skips_archive_entries() -> Result<()> {
+        let (temp, paths) = temp_paths();
+        let stub = install_ytdlp_stub(temp.path())?;
+        let _guard = set_ytdlp_stub_path(stub);
+        paths.prepare()?;
+        let metadata = MetadataStore::open(&paths.metadata_db).await?;
+        let mut archive = HashSet::from([String::from("alpha")]);
+        append_to_archive(&paths.archive, "alpha")?;
+
+        download_collection(
+            "videos",
+            "https://example.com/channel/videos".to_string(),
+            None,
+            &paths,
+            &mut archive,
+            MediaKind::Video,
+            &metadata,
+        )
+        .await?;
+
+        let contents = fs::read_to_string(&paths.archive)?;
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
         Ok(())
     }
 

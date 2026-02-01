@@ -8,33 +8,43 @@
 
 use std::{
     collections::HashMap,
+    fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path as AxumPath, State},
     http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use mime_guess::{MimeGuess, mime::Mime};
-use newtube_tools::config::{RuntimeOverrides, resolve_runtime_paths};
+use newtube_tools::config::{
+    DEFAULT_ENV_PATH, RuntimeOverrides, read_env_file, resolve_runtime_paths,
+};
 use newtube_tools::metadata::{
     CommentRecord, MetadataReader, SubtitleCollection, VideoRecord, VideoSource,
 };
 #[cfg(test)]
 use newtube_tools::metadata::{MetadataStore, SubtitleTrack};
 use newtube_tools::security::ensure_not_root;
-use parking_lot::RwLock;
-use serde::Serialize;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
-use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}, signal};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt},
+    signal,
+};
 use tokio_util::io::ReaderStream;
 
 // Directory layout defaults. Keeping them centralized means the same values
@@ -46,6 +56,8 @@ const SUBTITLES_SUBDIR: &str = "subtitles";
 
 // SQLite database file relative to the media root.
 const METADATA_DB_FILE: &str = "metadata.db";
+const SETTINGS_FILE: &str = "instance_settings.json";
+const DOWNLOADS_DIR: &str = "downloads";
 
 #[derive(Debug, Clone)]
 struct BackendArgs {
@@ -154,6 +166,370 @@ enum MediaCategory {
     Short,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MissingMediaBehavior {
+    NotFound,
+    Prompt,
+}
+
+impl MissingMediaBehavior {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "404" | "not_found" | "notfound" => Some(Self::NotFound),
+            "prompt" | "download" | "ask" => Some(Self::Prompt),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstanceSettings {
+    missing_media_behavior: MissingMediaBehavior,
+}
+
+impl InstanceSettings {
+    fn from_env(file_vars: &HashMap<String, String>) -> Self {
+        let raw = env_or_file_value("NEWTUBE_MISSING_MEDIA_BEHAVIOR", file_vars);
+        let missing_media_behavior = raw
+            .as_deref()
+            .and_then(MissingMediaBehavior::parse)
+            .unwrap_or(MissingMediaBehavior::NotFound);
+
+        Self {
+            missing_media_behavior,
+        }
+    }
+}
+
+struct SettingsStore {
+    path: PathBuf,
+    current: RwLock<InstanceSettings>,
+}
+
+impl SettingsStore {
+    fn load(media_root: &Path, defaults: InstanceSettings) -> Self {
+        let path = media_root.join(SETTINGS_FILE);
+        let current = match fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or(defaults),
+            Err(_) => defaults,
+        };
+
+        Self {
+            path,
+            current: RwLock::new(current),
+        }
+    }
+
+    fn get(&self) -> InstanceSettings {
+        self.current.read().clone()
+    }
+
+    fn update(&self, settings: InstanceSettings) -> Result<InstanceSettings> {
+        write_json_atomic(&self.path, &settings)?;
+        *self.current.write() = settings.clone();
+        Ok(settings)
+    }
+}
+
+#[derive(Clone)]
+struct DownloadManager {
+    inner: Arc<DownloadManagerInner>,
+}
+
+struct DownloadManagerInner {
+    jobs: Mutex<HashMap<String, DownloadJob>>,
+    counter: AtomicUsize,
+    media_root: PathBuf,
+    www_root: PathBuf,
+    downloader: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct DownloadJob {
+    id: String,
+    status: DownloadStatus,
+    progress_file: PathBuf,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DownloadStatus {
+    Queued,
+    Running,
+    Success,
+    Failed,
+}
+
+impl DownloadStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Success => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadJobResponse {
+    id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadJobStatus {
+    id: String,
+    status: String,
+    progress: u8,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadVideoRequest {
+    video_id: String,
+    media_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadChannelRequest {
+    video_id: String,
+    media_kind: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressReport {
+    progress: u8,
+    message: String,
+}
+
+impl DownloadManager {
+    fn new(media_root: PathBuf, www_root: PathBuf) -> Self {
+        let downloader = find_download_channel_executable().ok();
+        Self {
+            inner: Arc::new(DownloadManagerInner {
+                jobs: Mutex::new(HashMap::new()),
+                counter: AtomicUsize::new(1),
+                media_root,
+                www_root,
+                downloader,
+            }),
+        }
+    }
+
+    fn start_video_download(&self, video_id: String, media_kind: MediaCategory) -> Result<String> {
+        let downloader = self
+            .inner
+            .downloader
+            .clone()
+            .ok_or_else(|| anyhow!("download_channel binary not found"))?;
+        let job_id = self.next_job_id();
+        let progress_file = self.progress_file_path(&job_id);
+        write_progress_report(&progress_file, 0, "Queued download");
+
+        self.inner.jobs.lock().insert(
+            job_id.clone(),
+            DownloadJob {
+                id: job_id.clone(),
+                status: DownloadStatus::Queued,
+                progress_file: progress_file.clone(),
+                message: "Queued".to_string(),
+            },
+        );
+
+        let inner = self.inner.clone();
+        let job_id_clone = job_id.clone();
+        tokio::spawn(async move {
+            update_job_status(&inner, &job_id_clone, DownloadStatus::Running, "Running");
+            let inner_for_run = inner.clone();
+            let progress_for_run = progress_file.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                let args = vec![
+                    "--media-root".to_string(),
+                    inner_for_run.media_root.to_string_lossy().into_owned(),
+                    "--www-root".to_string(),
+                    inner_for_run.www_root.to_string_lossy().into_owned(),
+                    "--progress-file".to_string(),
+                    progress_for_run.to_string_lossy().into_owned(),
+                    "--video-id".to_string(),
+                    video_id,
+                    "--media-kind".to_string(),
+                    media_kind_label(media_kind).to_string(),
+                ];
+                run_download_channel(&downloader, args)
+            })
+            .await;
+
+            match status {
+                Ok(Ok(())) => {
+                    update_job_status(&inner, &job_id_clone, DownloadStatus::Success, "Done")
+                }
+                Ok(Err(err)) => {
+                    write_progress_report(&progress_file, 100, "Download failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                }
+                Err(err) => {
+                    write_progress_report(&progress_file, 100, "Download failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                }
+            }
+        });
+
+        Ok(job_id)
+    }
+
+    fn start_channel_download(
+        &self,
+        video_id: String,
+        media_kind: MediaCategory,
+    ) -> Result<String> {
+        let downloader = self
+            .inner
+            .downloader
+            .clone()
+            .ok_or_else(|| anyhow!("download_channel binary not found"))?;
+        let job_id = self.next_job_id();
+        let progress_file = self.progress_file_path(&job_id);
+        write_progress_report(&progress_file, 0, "Resolving channel");
+
+        self.inner.jobs.lock().insert(
+            job_id.clone(),
+            DownloadJob {
+                id: job_id.clone(),
+                status: DownloadStatus::Queued,
+                progress_file: progress_file.clone(),
+                message: "Queued".to_string(),
+            },
+        );
+
+        let inner = self.inner.clone();
+        let job_id_clone = job_id.clone();
+        tokio::spawn(async move {
+            update_job_status(
+                &inner,
+                &job_id_clone,
+                DownloadStatus::Running,
+                "Resolving channel",
+            );
+            let video_id_for_lookup = video_id.clone();
+            let channel_result = tokio::task::spawn_blocking(move || {
+                resolve_channel_url(&video_id_for_lookup, media_kind)
+            })
+            .await;
+
+            let channel_url = match channel_result {
+                Ok(Ok(url)) => url,
+                Ok(Err(err)) => {
+                    write_progress_report(&progress_file, 100, "Channel lookup failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    write_progress_report(&progress_file, 100, "Channel lookup failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                    return;
+                }
+            };
+
+            let inner_for_run = inner.clone();
+            let progress_for_run = progress_file.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                let args = vec![
+                    "--media-root".to_string(),
+                    inner_for_run.media_root.to_string_lossy().into_owned(),
+                    "--www-root".to_string(),
+                    inner_for_run.www_root.to_string_lossy().into_owned(),
+                    "--progress-file".to_string(),
+                    progress_for_run.to_string_lossy().into_owned(),
+                    channel_url,
+                ];
+                run_download_channel(&downloader, args)
+            })
+            .await;
+
+            match status {
+                Ok(Ok(())) => {
+                    update_job_status(&inner, &job_id_clone, DownloadStatus::Success, "Done")
+                }
+                Ok(Err(err)) => {
+                    write_progress_report(&progress_file, 100, "Download failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                }
+                Err(err) => {
+                    write_progress_report(&progress_file, 100, "Download failed");
+                    update_job_status(
+                        &inner,
+                        &job_id_clone,
+                        DownloadStatus::Failed,
+                        &format!("Failed: {err}"),
+                    );
+                }
+            }
+        });
+
+        Ok(job_id)
+    }
+
+    fn get_status(&self, job_id: &str) -> Option<DownloadJobStatus> {
+        let job = self.inner.jobs.lock().get(job_id).cloned()?;
+        let progress = read_progress_report(&job.progress_file);
+
+        let (progress_value, message) = progress
+            .map(|report| (report.progress, report.message))
+            .unwrap_or((0, job.message.clone()));
+
+        Some(DownloadJobStatus {
+            id: job.id,
+            status: job.status.as_str().to_string(),
+            progress: progress_value,
+            message,
+        })
+    }
+
+    fn next_job_id(&self) -> String {
+        let id = self.inner.counter.fetch_add(1, Ordering::Relaxed);
+        format!("download-{id}")
+    }
+
+    fn progress_file_path(&self, job_id: &str) -> PathBuf {
+        self.inner
+            .media_root
+            .join(DOWNLOADS_DIR)
+            .join(format!("{job_id}.json"))
+    }
+}
+
 /// Shared state injected into every Axum handler.
 ///
 /// * `reader` performs blocking SQLite reads via `spawn_blocking`.
@@ -166,6 +542,8 @@ struct AppState {
     cache: Arc<ApiCache>,
     files: Arc<FilePaths>,
     www_root: Arc<PathBuf>,
+    settings: Arc<SettingsStore>,
+    downloads: DownloadManager,
 }
 
 /// Very small in-memory cache to avoid re-querying SQLite on every request.
@@ -329,16 +707,27 @@ async fn main() -> Result<()> {
         .await
         .context("initializing metadata reader")?;
 
+    let env_vars = read_env_file(Path::new(DEFAULT_ENV_PATH)).unwrap_or_default();
+    let settings_defaults = InstanceSettings::from_env(&env_vars);
+    let settings_store = Arc::new(SettingsStore::load(&media_root, settings_defaults));
+    let downloads = DownloadManager::new(media_root.clone(), www_root.clone());
+
     let state = AppState {
         reader: Arc::new(reader),
         cache: Arc::new(ApiCache::new()),
         files: Arc::new(FilePaths::new(&media_root)),
         www_root: Arc::new(www_root),
+        settings: settings_store,
+        downloads,
     };
 
     // Each route is extremely small; helpers supplement anything that is shared
     // between videos and shorts.
     let app = Router::new()
+        .route("/api/settings", get(get_settings).put(update_settings))
+        .route("/api/downloads/video", post(start_video_download))
+        .route("/api/downloads/channel", post(start_channel_download))
+        .route("/api/downloads/{id}", get(get_download_status))
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/videos", get(list_videos))
         .route("/api/videos/{id}", get(get_video))
@@ -401,6 +790,56 @@ async fn static_fallback(State(state): State<AppState>, req: Request<Body>) -> R
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
+}
+
+async fn get_settings(State(state): State<AppState>) -> ApiResult<Json<InstanceSettings>> {
+    Ok(Json(state.settings.get()))
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<InstanceSettings>,
+) -> ApiResult<Json<InstanceSettings>> {
+    let updated = state
+        .settings
+        .update(payload)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    Ok(Json(updated))
+}
+
+async fn start_video_download(
+    State(state): State<AppState>,
+    Json(payload): Json<DownloadVideoRequest>,
+) -> ApiResult<Json<DownloadJobResponse>> {
+    let kind = parse_media_kind(payload.media_kind.as_deref());
+    let job_id = state
+        .downloads
+        .start_video_download(payload.video_id, kind)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    Ok(Json(DownloadJobResponse { id: job_id }))
+}
+
+async fn start_channel_download(
+    State(state): State<AppState>,
+    Json(payload): Json<DownloadChannelRequest>,
+) -> ApiResult<Json<DownloadJobResponse>> {
+    let kind = parse_media_kind(payload.media_kind.as_deref());
+    let job_id = state
+        .downloads
+        .start_channel_download(payload.video_id, kind)
+        .map_err(|err| ApiError::internal(err.to_string()))?;
+    Ok(Json(DownloadJobResponse { id: job_id }))
+}
+
+async fn get_download_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<DownloadJobStatus>> {
+    let status = state
+        .downloads
+        .get_status(&id)
+        .ok_or_else(|| ApiError::not_found("download not found"))?;
+    Ok(Json(status))
 }
 
 async fn serve_www_path(root: &Path, request_path: &str) -> ApiResult<Response> {
@@ -677,10 +1116,10 @@ impl AppState {
             .map_err(|err| ApiError::internal(err.to_string()))?;
 
         let mut last = self.cache.last_db_version.write();
-        if let Some(previous) = *last {
-            if version != previous {
-                self.cache.clear();
-            }
+        if let Some(previous) = *last
+            && version != previous
+        {
+            self.cache.clear();
         }
         *last = Some(version);
         Ok(())
@@ -883,11 +1322,7 @@ fn ensure_safe_path_segment(value: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn find_subtitle_file(
-    subtitles_root: &Path,
-    id: &str,
-    code: &str,
-) -> ApiResult<PathBuf> {
+async fn find_subtitle_file(subtitles_root: &Path, id: &str, code: &str) -> ApiResult<PathBuf> {
     let dir = subtitles_root.join(id);
     let mut entries = tokio::fs::read_dir(&dir)
         .await
@@ -922,8 +1357,7 @@ async fn find_subtitle_file(
             }
         }
     }
-    best
-        .map(|(_, path)| path)
+    best.map(|(_, path)| path)
         .ok_or_else(|| ApiError::not_found("subtitle track not found"))
 }
 
@@ -983,10 +1417,9 @@ async fn stream_file(
                 header::CONTENT_RANGE,
                 format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
             );
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                length.to_string().parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, length.to_string().parse().unwrap());
             response
         }
     } else {
@@ -1065,15 +1498,252 @@ fn parse_range_header(value: &header::HeaderValue, size: u64) -> Option<(u64, u6
     Some((start, end))
 }
 
+fn env_or_file_value(key: &str, file_vars: &HashMap<String, String>) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .or_else(|| file_vars.get(key).cloned())
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    let payload = serde_json::to_vec_pretty(value)?;
+    fs::write(&tmp_path, payload)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn write_progress_report(path: &Path, progress: u8, message: &str) {
+    let report = ProgressReport {
+        progress: progress.min(100),
+        message: message.to_string(),
+    };
+    if let Err(err) = write_json_atomic(path, &report) {
+        eprintln!("Failed to write progress report: {err}");
+    }
+}
+
+fn read_progress_report(path: &Path) -> Option<ProgressReport> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn update_job_status(
+    inner: &DownloadManagerInner,
+    job_id: &str,
+    status: DownloadStatus,
+    message: &str,
+) {
+    if let Some(job) = inner.jobs.lock().get_mut(job_id) {
+        job.status = status;
+        job.message = message.to_string();
+    }
+}
+
+fn media_kind_label(kind: MediaCategory) -> &'static str {
+    match kind {
+        MediaCategory::Video => "video",
+        MediaCategory::Short => "short",
+    }
+}
+
+fn parse_media_kind(value: Option<&str>) -> MediaCategory {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(ref value) if value == "short" || value == "shorts" => MediaCategory::Short,
+        _ => MediaCategory::Video,
+    }
+}
+
+fn find_download_channel_executable() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("NEWTUBE_DOWNLOAD_BIN") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let candidate = PathBuf::from(trimmed);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_download_channel") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    let docker_path = PathBuf::from("/usr/local/bin/download_channel");
+    if docker_path.exists() {
+        return Ok(docker_path);
+    }
+
+    let mut sibling = std::env::current_exe().context("locating backend executable")?;
+    sibling.set_file_name("download_channel");
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+
+    bail!("download_channel binary not found");
+}
+
+fn run_download_channel(binary: &Path, args: Vec<String>) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .context("launching download_channel")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("download_channel exited with {}", status)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
+        match self {
+            OneOrMany::One(value) => Box::new(std::iter::once(value)),
+            OneOrMany::Many(values) => Box::new(values.iter()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CreatorInfo {
+    Name(String),
+    Object {
+        url: Option<String>,
+        channel_url: Option<String>,
+        uploader_url: Option<String>,
+    },
+}
+
+impl CreatorInfo {
+    fn url(&self) -> Option<&str> {
+        match self {
+            CreatorInfo::Name(_) => None,
+            CreatorInfo::Object {
+                url,
+                channel_url,
+                uploader_url,
+            } => url
+                .as_deref()
+                .or(channel_url.as_deref())
+                .or(uploader_url.as_deref()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MinimalInfo {
+    channel_url: Option<OneOrMany<String>>,
+    uploader_url: Option<OneOrMany<String>>,
+    #[serde(default)]
+    creators: Option<Vec<CreatorInfo>>,
+    channel: Option<OneOrMany<CreatorInfo>>,
+    uploader: Option<OneOrMany<CreatorInfo>>,
+}
+
+fn first_channel_url(info: &MinimalInfo) -> Option<&str> {
+    if let Some(channel_urls) = &info.channel_url {
+        for url in channel_urls.iter() {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(uploader_urls) = &info.uploader_url {
+        for url in uploader_urls.iter() {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(channel) = &info.channel {
+        for creator in channel.iter() {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(uploader) = &info.uploader {
+        for creator in uploader.iter() {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(creators) = &info.creators {
+        for creator in creators {
+            if let Some(url) = creator.url()
+                && !url.trim().is_empty()
+            {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+fn video_url_for_kind(video_id: &str, kind: MediaCategory) -> String {
+    match kind {
+        MediaCategory::Video => format!("https://www.youtube.com/watch?v={video_id}"),
+        MediaCategory::Short => format!("https://www.youtube.com/shorts/{video_id}"),
+    }
+}
+
+fn resolve_channel_url(video_id: &str, kind: MediaCategory) -> Result<String> {
+    let video_url = video_url_for_kind(video_id, kind);
+    let output = std::process::Command::new("yt-dlp")
+        .arg("--dump-single-json")
+        .arg("--skip-download")
+        .arg("--no-warnings")
+        .arg("--no-progress")
+        .arg(&video_url)
+        .output()
+        .with_context(|| format!("fetching metadata for {video_url}"))?;
+
+    if !output.status.success() {
+        bail!("yt-dlp failed for {} (status {})", video_url, output.status);
+    }
+
+    let info: MinimalInfo =
+        serde_json::from_slice(&output.stdout).context("parsing yt-dlp metadata response")?;
+    let url = first_channel_url(&info).ok_or_else(|| anyhow!("channel url not found"))?;
+    Ok(url.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::to_bytes, extract::State as AxumState};
     use axum::http::HeaderMap;
+    use axum::{body::to_bytes, extract::State as AxumState};
     use libsql::{Builder, params};
     use serde_json::Value;
-    use std::{env, path::PathBuf, sync::Arc};
     use std::sync::Mutex;
+    use std::{env, path::PathBuf, sync::Arc};
     use tempfile::tempdir;
 
     struct BackendTestContext {
@@ -1115,6 +1785,16 @@ mod tests {
                     cache: Arc::new(ApiCache::new()),
                     files: Arc::new(files),
                     www_root: Arc::new(www_root),
+                    settings: Arc::new(SettingsStore::load(
+                        temp.path(),
+                        InstanceSettings {
+                            missing_media_behavior: MissingMediaBehavior::NotFound,
+                        },
+                    )),
+                    downloads: DownloadManager::new(
+                        temp.path().to_path_buf(),
+                        temp.path().join("www"),
+                    ),
                 },
                 db_path,
                 store,
@@ -1148,14 +1828,14 @@ mod tests {
         }
 
         async fn delete_by_videoid(&self, table: &str, value: &str) {
-            let db = Builder::new_local(&self.db_path)
-                .build()
-                .await
-                .unwrap();
+            let db = Builder::new_local(&self.db_path).build().await.unwrap();
             let conn = db.connect().unwrap();
-            conn.execute(&format!("DELETE FROM {table} WHERE videoid = ?1"), params![value])
-                .await
-                .unwrap();
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE videoid = ?1"),
+                params![value],
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -1207,7 +1887,10 @@ mod tests {
     }
 
     fn parse_backend_args(env_values: &[(&str, &str)], extra: &[&str]) -> BackendArgs {
-        let argv = extra.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        let argv = extra
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
         let mut parsed = None;
         with_env_file(env_values, || {
             parsed = Some(BackendArgs::from_iter(argv.clone()).expect("parsed args"));
@@ -1302,7 +1985,8 @@ mod tests {
             }],
         )
         .await;
-        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]).await;
+        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")])
+            .await;
 
         let first = ctx.state.get_bootstrap().await.unwrap();
         assert_eq!(first.videos.len(), 1);
@@ -1386,7 +2070,8 @@ mod tests {
     async fn comments_and_subtitles_cache() {
         let mut ctx = BackendTestContext::new().await;
         ctx.insert_video("alpha").await;
-        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")]).await;
+        ctx.insert_comments("alpha", vec![sample_comment("1", "alpha")])
+            .await;
         ctx.insert_subtitles(
             "alpha",
             vec![SubtitleTrack {

@@ -14,7 +14,7 @@ use newtube_tools::metadata::{
     CommentRecord, MetadataStore, SubtitleCollection, SubtitleTrack, VideoRecord, VideoSource,
 };
 use newtube_tools::security::ensure_not_root;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
@@ -92,7 +92,10 @@ struct Paths {
 
 #[derive(Debug, Clone)]
 struct DownloaderArgs {
-    channel_url: String,
+    channel_url: Option<String>,
+    video_id: Option<String>,
+    media_kind: Option<MediaKind>,
+    progress_file: Option<PathBuf>,
     media_root: PathBuf,
     www_root: PathBuf,
 }
@@ -114,6 +117,9 @@ impl DownloaderArgs {
         let mut media_root_override: Option<PathBuf> = None;
         let mut www_root_override: Option<PathBuf> = None;
         let mut channel_url: Option<String> = None;
+        let mut video_id: Option<String> = None;
+        let mut media_kind: Option<MediaKind> = None;
+        let mut progress_file: Option<PathBuf> = None;
         let mut args = iter.into_iter();
 
         while let Some(arg) = args.next() {
@@ -132,6 +138,18 @@ impl DownloaderArgs {
                 www_root_override = Some(PathBuf::from(value));
                 continue;
             }
+            if let Some(value) = arg.strip_prefix("--video-id=") {
+                Self::set_video_id(&mut video_id, value.to_string())?;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--media-kind=") {
+                media_kind = Some(Self::parse_media_kind(value)?);
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--progress-file=") {
+                progress_file = Some(PathBuf::from(value));
+                continue;
+            }
 
             match arg.as_str() {
                 "--media-root" => {
@@ -146,6 +164,24 @@ impl DownloaderArgs {
                         .ok_or_else(|| anyhow::anyhow!("--www-root requires a value"))?;
                     www_root_override = Some(PathBuf::from(value));
                 }
+                "--video-id" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--video-id requires a value"))?;
+                    Self::set_video_id(&mut video_id, value)?;
+                }
+                "--media-kind" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--media-kind requires a value"))?;
+                    media_kind = Some(Self::parse_media_kind(&value)?);
+                }
+                "--progress-file" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--progress-file requires a value"))?;
+                    progress_file = Some(PathBuf::from(value));
+                }
                 _ if arg.starts_with('-') => {
                     bail!("unknown argument: {arg}");
                 }
@@ -155,11 +191,17 @@ impl DownloaderArgs {
             }
         }
 
-        let channel_url = channel_url.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Usage: download_channel [--media-root <path>] [--www-root <path>] <channel_url>"
-            )
-        })?;
+        if channel_url.is_some() && video_id.is_some() {
+            bail!("cannot provide both a channel URL and --video-id");
+        }
+        if channel_url.is_some() && media_kind.is_some() {
+            bail!("--media-kind can only be used with --video-id");
+        }
+        if channel_url.is_none() && video_id.is_none() {
+            bail!(
+                "Usage: download_channel [--media-root <path>] [--www-root <path>] [--progress-file <path>] <channel_url>\n       download_channel [--media-root <path>] [--www-root <path>] [--progress-file <path>] --video-id <id> [--media-kind video|short]"
+            );
+        }
 
         let runtime_paths = resolve_runtime_paths(RuntimeOverrides {
             media_root: media_root_override.clone(),
@@ -171,6 +213,9 @@ impl DownloaderArgs {
 
         Ok(Self {
             channel_url,
+            video_id,
+            media_kind,
+            progress_file,
             media_root,
             www_root,
         })
@@ -182,6 +227,76 @@ impl DownloaderArgs {
         }
         *target = Some(value);
         Ok(())
+    }
+
+    fn set_video_id(target: &mut Option<String>, value: String) -> Result<()> {
+        if target.is_some() {
+            bail!("video id specified multiple times");
+        }
+        *target = Some(value);
+        Ok(())
+    }
+
+    fn parse_media_kind(value: &str) -> Result<MediaKind> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "video" => Ok(MediaKind::Video),
+            "short" | "shorts" => Ok(MediaKind::Short),
+            _ => bail!("unknown media kind: {value}"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressReport {
+    progress: u8,
+    message: String,
+}
+
+#[derive(Clone)]
+struct ProgressWriter {
+    path: PathBuf,
+}
+
+impl ProgressWriter {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn write(&self, progress: u8, message: &str) {
+        let report = ProgressReport {
+            progress: progress.min(100),
+            message: message.to_string(),
+        };
+
+        if let Some(parent) = self.path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            eprintln!("Warning: could not create progress dir: {err}");
+            return;
+        }
+
+        let tmp_path = self.path.with_extension("tmp");
+        match serde_json::to_vec(&report) {
+            Ok(payload) => {
+                if let Err(err) = fs::write(&tmp_path, payload) {
+                    eprintln!("Warning: could not write progress file: {err}");
+                    return;
+                }
+                if let Err(err) = fs::rename(&tmp_path, &self.path) {
+                    eprintln!("Warning: could not finalize progress file: {err}");
+                }
+            }
+            Err(err) => {
+                eprintln!("Warning: could not serialize progress report: {err}");
+            }
+        }
+    }
+}
+
+fn update_progress(progress: Option<&ProgressWriter>, percent: u8, message: &str) {
+    if let Some(writer) = progress {
+        writer.write(percent, message);
     }
 }
 
@@ -232,27 +347,23 @@ impl CreatorInfo {
     fn name(&self) -> Option<&str> {
         match self {
             CreatorInfo::Name(value) => Some(value.as_str()),
-            CreatorInfo::Object { name, title, .. } => name
-                .as_deref()
-                .or_else(|| title.as_deref()),
+            CreatorInfo::Object { name, title, .. } => name.as_deref().or(title.as_deref()),
         }
     }
 
     fn url(&self) -> Option<&str> {
         match self {
             CreatorInfo::Name(_) => None,
-            CreatorInfo::Object { url, channel_url, .. } => {
-                url.as_deref().or_else(|| channel_url.as_deref())
-            }
+            CreatorInfo::Object {
+                url, channel_url, ..
+            } => url.as_deref().or(channel_url.as_deref()),
         }
     }
 
     fn id(&self) -> Option<&str> {
         match self {
             CreatorInfo::Name(_) => None,
-            CreatorInfo::Object { id, channel_id, .. } => {
-                id.as_deref().or_else(|| channel_id.as_deref())
-            }
+            CreatorInfo::Object { id, channel_id, .. } => id.as_deref().or(channel_id.as_deref()),
         }
     }
 }
@@ -291,6 +402,7 @@ struct VideoInfo {
     formats: Option<Vec<FormatInfo>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SubtitleInfo {
     url: Option<String>,
@@ -340,10 +452,17 @@ struct RawComment {
 
 /// Distinguishes long-form uploads from Shorts so we can route files to the
 /// right directory and API slug.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaKind {
     Video,
     Short,
+}
+
+fn video_url_for_kind(video_id: &str, kind: MediaKind) -> String {
+    match kind {
+        MediaKind::Video => format!("https://www.youtube.com/watch?v={video_id}"),
+        MediaKind::Short => format!("https://www.youtube.com/shorts/{video_id}"),
+    }
 }
 
 /// CLI entry point. Validates prerequisites, prepares directories, and kicks
@@ -354,6 +473,9 @@ async fn main() -> Result<()> {
 
     let DownloaderArgs {
         channel_url,
+        video_id,
+        media_kind,
+        progress_file,
         media_root,
         www_root,
     } = DownloaderArgs::parse()?;
@@ -362,15 +484,23 @@ async fn main() -> Result<()> {
 
     let paths = Paths::with_roots(&media_root, &www_root);
     paths.prepare()?;
-    let metadata =
-        MetadataStore::open(&paths.metadata_db)
-            .await
-            .context("initializing metadata database")?;
+    let metadata = MetadataStore::open(&paths.metadata_db)
+        .await
+        .context("initializing metadata database")?;
+    let progress = progress_file.map(ProgressWriter::new);
 
     println!("===================================");
     println!("YouTube Channel Downloader");
     println!("===================================");
-    println!("Channel: {}", channel_url);
+    if let Some(video_id) = &video_id {
+        let kind_label = match media_kind.unwrap_or(MediaKind::Video) {
+            MediaKind::Video => "Video",
+            MediaKind::Short => "Short",
+        };
+        println!("Target: {kind_label} {video_id}");
+    } else if let Some(channel_url) = &channel_url {
+        println!("Channel: {}", channel_url);
+    }
     println!("Base directory: {}", paths.base.display());
     println!("WWW root: {}", paths.www_root.display());
     println!();
@@ -380,27 +510,31 @@ async fn main() -> Result<()> {
 
     let mut archive = load_archive(&paths.archive)?;
 
-    download_collection(
-        "regular videos",
-        build_channel_list_url(&channel_url, MediaKind::Video),
-        Some("!is_live & original_url!*=/shorts/"),
-        &paths,
-        &mut archive,
-        MediaKind::Video,
-        &metadata,
-    )
-    .await?;
+    if let Some(video_id) = &video_id {
+        let kind = media_kind.unwrap_or(MediaKind::Video);
+        update_progress(progress.as_ref(), 5, "Preparing download");
+        download_single_video(
+            video_id,
+            kind,
+            &paths,
+            &mut archive,
+            &metadata,
+            progress.as_ref(),
+        )
+        .await?;
+    } else if let Some(channel_url) = &channel_url {
+        update_progress(progress.as_ref(), 0, "Fetching channel list");
+        download_channel_entries(
+            channel_url,
+            &paths,
+            &mut archive,
+            &metadata,
+            progress.as_ref(),
+        )
+        .await?;
+    }
 
-    download_collection(
-        "shorts",
-        build_channel_list_url(&channel_url, MediaKind::Short),
-        Some("original_url*=/shorts/"),
-        &paths,
-        &mut archive,
-        MediaKind::Short,
-        &metadata,
-    )
-    .await?;
+    update_progress(progress.as_ref(), 100, "Download complete");
 
     println!();
     println!("===================================");
@@ -540,6 +674,7 @@ fn append_to_archive(path: &Path, video_id: &str) -> Result<()> {
 
 /// Given a playlist (videos, Shorts, etc.), download each entry and refresh its
 /// metadata.
+#[allow(dead_code)]
 async fn download_collection(
     label: &str,
     list_url: String,
@@ -588,6 +723,156 @@ async fn download_collection(
     Ok(())
 }
 
+async fn download_channel_entries(
+    channel_url: &str,
+    paths: &Paths,
+    archive: &mut HashSet<String>,
+    metadata: &MetadataStore,
+    progress: Option<&ProgressWriter>,
+) -> Result<()> {
+    println!("Getting list of regular videos...");
+    let videos = get_video_ids(
+        &build_channel_list_url(channel_url, MediaKind::Video),
+        Some("!is_live & original_url!*=/shorts/"),
+    )?;
+
+    println!("Getting list of shorts...");
+    let shorts = get_video_ids(
+        &build_channel_list_url(channel_url, MediaKind::Short),
+        Some("original_url*=/shorts/"),
+    )?;
+
+    let total = videos.len() + shorts.len();
+    if total == 0 {
+        println!("No videos found.");
+        update_progress(progress, 100, "No videos found");
+        return Ok(());
+    }
+
+    let mut completed = 0usize;
+    process_media_list(
+        "regular videos",
+        &videos,
+        MediaKind::Video,
+        paths,
+        archive,
+        metadata,
+        &mut completed,
+        total,
+        progress,
+    )
+    .await?;
+    process_media_list(
+        "shorts",
+        &shorts,
+        MediaKind::Short,
+        paths,
+        archive,
+        metadata,
+        &mut completed,
+        total,
+        progress,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_media_list(
+    label: &str,
+    ids: &[String],
+    media_kind: MediaKind,
+    paths: &Paths,
+    archive: &mut HashSet<String>,
+    metadata: &MetadataStore,
+    completed: &mut usize,
+    total: usize,
+    progress: Option<&ProgressWriter>,
+) -> Result<()> {
+    if ids.is_empty() {
+        println!("No {} found", label);
+        println!();
+        return Ok(());
+    }
+
+    println!("Found {} {}", ids.len(), label);
+    println!();
+
+    for video_id in ids {
+        let current = *completed + 1;
+        if let Err(err) = process_media_entry(
+            video_id, current, total, paths, archive, media_kind, metadata,
+        )
+        .await
+        {
+            eprintln!("  Warning: failed to process {}: {}", video_id, err);
+        }
+
+        *completed += 1;
+        if total > 0 {
+            let percent = ((*completed * 100) / total) as u8;
+            update_progress(
+                progress,
+                percent,
+                &format!("Downloading {}/{}", *completed, total),
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "{} download complete!",
+        label
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string() + &label[1..])
+            .unwrap_or_else(|| label.to_string()),
+    );
+    println!();
+
+    Ok(())
+}
+
+async fn download_single_video(
+    video_id: &str,
+    media_kind: MediaKind,
+    paths: &Paths,
+    archive: &mut HashSet<String>,
+    metadata: &MetadataStore,
+    progress: Option<&ProgressWriter>,
+) -> Result<()> {
+    let output_dir = paths.media_dir(media_kind);
+    let video_url = video_url_for_kind(video_id, media_kind);
+    let already_downloaded = archive.contains(video_id);
+    let mut download_failed = false;
+
+    if already_downloaded {
+        update_progress(progress, 40, "Refreshing metadata");
+    } else {
+        update_progress(progress, 20, "Downloading media");
+        if let Err(err) = download_video_all_formats(video_id, &video_url, output_dir, paths) {
+            eprintln!("  Warning: failed to download {}: {}", video_id, err);
+            download_failed = true;
+        } else {
+            append_to_archive(&paths.archive, video_id)?;
+            archive.insert(video_id.to_owned());
+        }
+    }
+
+    update_progress(progress, 75, "Refreshing metadata");
+    refresh_metadata(
+        video_id, &video_url, output_dir, paths, media_kind, metadata,
+    )
+    .await?;
+
+    if download_failed {
+        bail!("download failed for {}", video_id);
+    }
+
+    Ok(())
+}
+
 /// Handles a single video/short: download media if missing, then refresh all
 /// metadata artifacts.
 async fn process_media_entry(
@@ -604,7 +889,7 @@ async fn process_media_entry(
     // contains every muxed format. We still refresh metadata because stats can
     // change over time.
     let already_downloaded = archive.contains(video_id);
-    let video_url = format!("https://www.youtube.com/watch?v={video_id}");
+    let video_url = video_url_for_kind(video_id, media_kind);
 
     if already_downloaded {
         println!(
@@ -616,7 +901,7 @@ async fn process_media_entry(
             "[{}/{}] Downloading and indexing {}",
             current, total, video_id
         );
-        if let Err(err) = download_video_all_formats(video_id, output_dir, paths) {
+        if let Err(err) = download_video_all_formats(video_id, &video_url, output_dir, paths) {
             eprintln!("  Warning: failed to download {}: {}", video_id, err);
         } else {
             append_to_archive(&paths.archive, video_id)?;
@@ -1150,7 +1435,10 @@ fn collect_sources_from_disk(
         if matches!(ext, "m4a" | "mp3" | "aac" | "opus" | "flac" | "wav") {
             continue;
         }
-        if matches!(ext, "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2") {
+        if matches!(
+            ext,
+            "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2"
+        ) {
             continue;
         }
         let size = entry.metadata().ok().map(|meta| meta.len() as i64);
@@ -1292,10 +1580,10 @@ fn collect_raw_comments(value: Value, parent_hint: Option<&str>, out: &mut Vec<R
             let comment_value = Value::Object(map);
             match serde_json::from_value::<RawComment>(comment_value) {
                 Ok(mut raw) => {
-                    if raw.parent.is_none() {
-                        if let Some(parent) = parent_hint {
-                            raw.parent = Some(parent.to_string());
-                        }
+                    if raw.parent.is_none()
+                        && let Some(parent) = parent_hint
+                    {
+                        raw.parent = Some(parent.to_string());
                     }
                     let current_id = raw.id.clone();
                     out.push(raw);
@@ -1476,8 +1764,12 @@ fn get_video_ids(list_url: &str, filter: Option<&str>) -> Result<Vec<String>> {
 
 /// Downloads every available muxed format for the provided video id, skipping
 /// streams we already grabbed.
-fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) -> Result<()> {
-    let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
+fn download_video_all_formats(
+    video_id: &str,
+    video_url: &str,
+    output_dir: &Path,
+    paths: &Paths,
+) -> Result<()> {
     let video_dir = output_dir.join(video_id);
     fs::create_dir_all(&video_dir).with_context(|| format!("creating {}", video_dir.display()))?;
 
@@ -1487,11 +1779,11 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
 
     println!("Processing video: {}", video_id);
 
-    run_metadata_command(&video_url, &base_output_pattern, &paths.cookies);
-    run_subtitle_command(video_id, &video_url, &paths.subtitles, &paths.cookies);
-    run_thumbnail_command(video_id, &video_url, &paths.thumbnails, &paths.cookies);
+    run_metadata_command(video_url, &base_output_pattern, &paths.cookies);
+    run_subtitle_command(video_id, video_url, &paths.subtitles, &paths.cookies);
+    run_thumbnail_command(video_id, video_url, &paths.thumbnails, &paths.cookies);
 
-    let formats = collect_format_ids(&info_json_path, &video_url)?;
+    let formats = collect_format_ids(&info_json_path, video_url)?;
 
     if formats.is_empty() {
         bail!("no downloadable formats found for {}", video_id);
@@ -1523,7 +1815,7 @@ fn download_video_all_formats(video_id: &str, output_dir: &Path, paths: &Paths) 
             .arg("--continue")
             .arg("--ignore-errors")
             .arg("--no-warnings")
-            .arg(&video_url);
+            .arg(video_url);
 
         if paths.cookies.exists() {
             command
@@ -1564,9 +1856,7 @@ fn format_output_exists(video_dir: &Path, video_id: &str, format_id: &str) -> bo
             {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if !name.starts_with(&prefix)
-                    || name.chars().nth(prefix.len()) != Some('.')
-                {
+                if !name.starts_with(&prefix) || name.chars().nth(prefix.len()) != Some('.') {
                     continue;
                 }
 
@@ -1578,7 +1868,10 @@ fn format_output_exists(video_dir: &Path, video_id: &str, format_id: &str) -> bo
                 if matches!(ext, "m4a" | "mp3" | "aac" | "opus" | "flac" | "wav") {
                     continue;
                 }
-                if matches!(ext, "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2") {
+                if matches!(
+                    ext,
+                    "mhtml" | "json" | "txt" | "m3u8" | "mpd" | "ytdl" | "aria2"
+                ) {
                     continue;
                 }
 
@@ -1782,8 +2075,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{env, fs, path::PathBuf};
     use std::sync::Mutex;
+    use std::{env, fs, path::PathBuf};
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1823,7 +2116,13 @@ mod tests {
             },
         );
         let args = parsed.unwrap();
-        assert_eq!(args.channel_url, "https://www.youtube.com/@Channel");
+        assert_eq!(
+            args.channel_url.as_deref(),
+            Some("https://www.youtube.com/@Channel")
+        );
+        assert!(args.video_id.is_none());
+        assert!(args.media_kind.is_none());
+        assert!(args.progress_file.is_none());
         assert_eq!(args.media_root, PathBuf::from(DEFAULT_MEDIA_ROOT));
         assert_eq!(args.www_root, PathBuf::from(DEFAULT_WWW_ROOT));
     }
@@ -1853,6 +2152,27 @@ mod tests {
 
         assert_eq!(args.media_root, PathBuf::from("/data/media"));
         assert_eq!(args.www_root, PathBuf::from("/srv/www"));
+    }
+
+    #[test]
+    fn downloader_args_accept_video_id() {
+        let mut parsed = None;
+        with_env_file(
+            &[
+                ("MEDIA_ROOT", DEFAULT_MEDIA_ROOT),
+                ("WWW_ROOT", DEFAULT_WWW_ROOT),
+            ],
+            || {
+                parsed = Some(
+                    DownloaderArgs::from_slice(&["--video-id", "abc123", "--media-kind", "short"])
+                        .unwrap(),
+                );
+            },
+        );
+        let args = parsed.unwrap();
+        assert_eq!(args.video_id.as_deref(), Some("abc123"));
+        assert_eq!(args.media_kind, Some(MediaKind::Short));
+        assert!(args.channel_url.is_none());
     }
 
     fn sample_video_info() -> VideoInfo {

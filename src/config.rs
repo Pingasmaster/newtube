@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::{
     collections::HashMap,
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -45,11 +44,7 @@ fn build_runtime_paths(
     file_vars: &HashMap<String, String>,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<RuntimePaths> {
-    build_runtime_paths_with_overrides(
-        file_vars,
-        env_lookup,
-        RuntimeOverrides::default(),
-    )
+    build_runtime_paths_with_overrides(file_vars, env_lookup, RuntimeOverrides::default())
 }
 
 fn build_runtime_paths_with_overrides(
@@ -114,12 +109,13 @@ fn lookup_value(
     env_lookup(key).or_else(|| file_vars.get(key).cloned())
 }
 
-fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
+pub fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     let mut vars = HashMap::new();
     if !path.exists() {
         return Ok(vars);
     }
-    let content = fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -137,7 +133,11 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
         let value = value
             .strip_prefix('"')
             .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
             .unwrap_or(value);
         vars.insert(key.to_string(), value.to_string());
     }
@@ -164,7 +164,8 @@ mod tests {
 
     #[test]
     fn load_runtime_paths_reads_port() {
-        let runtime = runtime_from("MEDIA_ROOT=\"/yt\"\nWWW_ROOT=\"/www\"\nNEWTUBE_PORT=\"4242\"\n");
+        let runtime =
+            runtime_from("MEDIA_ROOT=\"/yt\"\nWWW_ROOT=\"/www\"\nNEWTUBE_PORT=\"4242\"\n");
         assert_eq!(runtime.newtube_port, 4242);
     }
 
@@ -196,8 +197,8 @@ mod tests {
 
     #[test]
     fn build_runtime_paths_prefers_env_over_file() {
-        let vars = read_env_file(make_config("MEDIA_ROOT=\"/file\"\nWWW_ROOT=\"/www\"\n").path())
-            .unwrap();
+        let vars =
+            read_env_file(make_config("MEDIA_ROOT=\"/file\"\nWWW_ROOT=\"/www\"\n").path()).unwrap();
         let runtime = build_runtime_paths(&vars, |key| {
             if key == "MEDIA_ROOT" {
                 Some("/env".to_string())

@@ -437,6 +437,26 @@ class DatabaseManager {
         }
     }
 
+    async getSettings() {
+        return this.api.fetchSettings();
+    }
+
+    async updateSettings(settings) {
+        return this.api.updateSettings(settings);
+    }
+
+    async startVideoDownload(videoId, mediaKind) {
+        return this.api.startVideoDownload(videoId, mediaKind);
+    }
+
+    async startChannelDownload(videoId, mediaKind) {
+        return this.api.startChannelDownload(videoId, mediaKind);
+    }
+
+    async getDownloadStatus(jobId) {
+        return this.api.fetchDownloadStatus(jobId);
+    }
+
     async getAllVideos() {
         await this.init();
         const videos = await this.getAllFromStore('videos');
@@ -562,6 +582,28 @@ class ApiClient {
         return response.json();
     }
 
+    async sendJson(method, path, payload) {
+        const response = await fetch(`${this.baseUrl}${path}`, {
+            method,
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+            throw new Error(`Request failed (${response.status})`);
+        }
+        return response.json();
+    }
+
+    postJson(path, payload) {
+        return this.sendJson('POST', path, payload);
+    }
+
+    putJson(path, payload) {
+        return this.sendJson('PUT', path, payload);
+    }
+
     fetchVideos() {
         return this.fetchJson('/videos');
     }
@@ -589,6 +631,32 @@ class ApiClient {
     fetchBootstrap() {
         return this.fetchJson('/bootstrap');
     }
+
+    fetchSettings() {
+        return this.fetchJson('/settings');
+    }
+
+    updateSettings(settings) {
+        return this.putJson('/settings', settings);
+    }
+
+    startVideoDownload(videoId, mediaKind) {
+        return this.postJson('/downloads/video', {
+            videoId,
+            mediaKind
+        });
+    }
+
+    startChannelDownload(videoId, mediaKind) {
+        return this.postJson('/downloads/channel', {
+            videoId,
+            mediaKind
+        });
+    }
+
+    fetchDownloadStatus(jobId) {
+        return this.fetchJson(`/downloads/${encodeURIComponent(jobId)}`);
+    }
 }
 
 // Global App Router
@@ -609,6 +677,11 @@ class App {
             'shorts': {
                 title: 'NewTube - Shorts',
                 script: 'pageViewer.js',
+                class: null
+            },
+            'admin': {
+                title: 'NewTube - Admin',
+                script: 'pageAdmin.js',
                 class: null
             }
         };
@@ -658,6 +731,9 @@ class App {
                 case 'shorts':
                     pageConfig.class = ViewerPage;
                     break;
+                case 'admin':
+                    pageConfig.class = AdminPage;
+                    break;
             }
         }
 
@@ -690,7 +766,9 @@ class App {
         // Determine which page to load based on URL
         const path = window.location.pathname;
         
-        if (path.startsWith('/watch')) {
+        if (path.startsWith('/admin')) {
+            this.changePage('admin');
+        } else if (path.startsWith('/watch')) {
             this.changePage('watch');
         } else if (path.startsWith('/shorts/')) {
             this.changePage('shorts');
@@ -717,7 +795,21 @@ class App {
                 getShort: (videoId) => this.database.getShort(videoId),
                 getSubtitles: (videoId) => this.database.getSubtitles(videoId),
                 getComments: (videoId) => this.database.getComments(videoId),
-                getCommentReplies: (commentId) => this.database.getCommentReplies(commentId)
+                getCommentReplies: (commentId) => this.database.getCommentReplies(commentId),
+                getSettings: () => this.database.getSettings(),
+                startVideoDownload: (videoId, mediaKind) =>
+                    this.database.startVideoDownload(videoId, mediaKind),
+                startChannelDownload: (videoId, mediaKind) =>
+                    this.database.startChannelDownload(videoId, mediaKind),
+                getDownloadStatus: (jobId) => this.database.getDownloadStatus(jobId)
+            };
+        }
+
+        if (pageName === 'admin') {
+            return {
+                ready: () => this.databaseReady,
+                getSettings: () => this.database.getSettings(),
+                updateSettings: (settings) => this.database.updateSettings(settings)
             };
         }
 

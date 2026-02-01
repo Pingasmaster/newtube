@@ -4,6 +4,7 @@ class BaseViewer {
         this.services = services;
         this.container = null;
         this.videoData = null;
+        this.downloadTimer = null;
     }
 
     async init() {
@@ -15,6 +16,10 @@ class BaseViewer {
     }
 
     close() {
+        if (this.downloadTimer) {
+            clearTimeout(this.downloadTimer);
+            this.downloadTimer = null;
+        }
         if (this.container) {
             this.container.innerHTML = '';
         }
@@ -171,6 +176,159 @@ class BaseViewer {
             player.appendChild(element);
         });
     }
+
+    async maybeShowMissingPrompt(kind, videoId) {
+        if (!this.services || typeof this.services.getSettings !== 'function') {
+            return false;
+        }
+
+        let settings = null;
+        try {
+            settings = await this.services.getSettings();
+        } catch {
+            return false;
+        }
+
+        if (!settings || settings.missingMediaBehavior !== 'prompt') {
+            return false;
+        }
+
+        this.renderMissingMediaPrompt(kind, videoId);
+        return true;
+    }
+
+    renderMissingMediaPrompt(kind, videoId) {
+        const label = kind === 'short' ? 'Short' : 'Video';
+        const subtitle =
+            kind === 'short'
+                ? "This Short isn't available in this instance yet."
+                : "This video isn't available in this instance yet.";
+
+        this.container.innerHTML = `
+            <div class="page-viewer">
+                <div class="missing-media">
+                    <div class="missing-media-card">
+                        <div class="missing-media-badge">${label} unavailable</div>
+                        <h1>${label} not found</h1>
+                        <p>${subtitle}</p>
+                        <div class="missing-media-actions">
+                            <button class="missing-media-btn primary" type="button">
+                                Download this ${label.toLowerCase()}
+                            </button>
+                            <button class="missing-media-btn" type="button">
+                                Download the whole channel
+                            </button>
+                        </div>
+                        <div class="missing-media-progress">
+                            <div class="missing-media-status">Ready to download.</div>
+                            <div class="missing-media-bar">
+                                <span class="missing-media-bar-fill"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const progressWrap = this.container.querySelector('.missing-media-progress');
+        const statusEl = this.container.querySelector('.missing-media-status');
+        const bar = this.container.querySelector('.missing-media-bar');
+        const barFill = this.container.querySelector('.missing-media-bar-fill');
+        const buttons = Array.from(this.container.querySelectorAll('.missing-media-btn'));
+        const [downloadBtn, channelBtn] = buttons;
+
+        const setBusy = (busy) => {
+            buttons.forEach((btn) => {
+                btn.disabled = busy;
+                btn.classList.toggle('busy', busy);
+            });
+            if (progressWrap) {
+                progressWrap.classList.toggle('active', busy);
+            }
+        };
+
+        const updateProgress = (progress, message, indeterminate = false) => {
+            if (statusEl && message) {
+                statusEl.textContent = message;
+            }
+            if (!bar || !barFill) {
+                return;
+            }
+            bar.classList.toggle('indeterminate', indeterminate);
+            if (typeof progress === 'number') {
+                const safe = Math.max(0, Math.min(100, progress));
+                barFill.style.width = `${safe}%`;
+            }
+        };
+
+        const pollStatus = async (jobId) => {
+            if (!this.services || typeof this.services.getDownloadStatus !== 'function') {
+                updateProgress(null, 'Download status unavailable.', true);
+                setBusy(false);
+                return;
+            }
+
+            try {
+                const status = await this.services.getDownloadStatus(jobId);
+                if (status && typeof status.progress === 'number') {
+                    updateProgress(status.progress, status.message || 'Downloading...');
+                } else {
+                    updateProgress(null, status?.message || 'Downloading...', true);
+                }
+
+                if (status?.status === 'completed') {
+                    updateProgress(100, 'Download complete. Reloading...');
+                    setTimeout(() => window.location.reload(), 1200);
+                    return;
+                }
+
+                if (status?.status === 'failed') {
+                    updateProgress(null, status.message || 'Download failed.', true);
+                    setBusy(false);
+                    return;
+                }
+            } catch (error) {
+                updateProgress(null, `Download check failed: ${error.message}`, true);
+                setBusy(false);
+                return;
+            }
+
+            this.downloadTimer = setTimeout(() => pollStatus(jobId), 2000);
+        };
+
+        const startDownload = async (mode) => {
+            if (!this.services) {
+                updateProgress(null, 'Download service unavailable.', true);
+                return;
+            }
+
+            try {
+                setBusy(true);
+                updateProgress(null, 'Starting download...', true);
+
+                const response =
+                    mode === 'video'
+                        ? await this.services.startVideoDownload(videoId, kind)
+                        : await this.services.startChannelDownload(videoId, kind);
+
+                if (!response || !response.id) {
+                    throw new Error('No download job id returned');
+                }
+
+                pollStatus(response.id);
+            } catch (error) {
+                updateProgress(null, `Failed to start download: ${error.message}`, true);
+                setBusy(false);
+            }
+        };
+
+        if (downloadBtn) {
+            downloadBtn.addEventListener('click', () => startDownload('video'));
+        }
+        if (channelBtn) {
+            channelBtn.addEventListener('click', () => startDownload('channel'));
+        }
+    }
 }
 
 // Regular Video Viewer
@@ -192,7 +350,10 @@ class VideoViewer extends BaseViewer {
         this.videoData = await this.services.getVideo(this.videoid);
         
         if (!this.videoData) {
-            this.renderError('Video not found');
+            const handled = await this.maybeShowMissingPrompt('video', this.videoid);
+            if (!handled) {
+                this.renderError('Video not found');
+            }
             return;
         }
 
@@ -517,7 +678,10 @@ class ShortsViewer extends BaseViewer {
         this.videoData = await this.services.getShort(this.videoid);
         
         if (!this.videoData) {
-            this.renderError('Short not found');
+            const handled = await this.maybeShowMissingPrompt('short', this.videoid);
+            if (!handled) {
+                this.renderError('Short not found');
+            }
             return;
         }
 
@@ -714,7 +878,11 @@ class ViewerPage {
             getShort: () => Promise.resolve(null),
             getSubtitles: () => Promise.resolve(null),
             getComments: () => Promise.resolve([]),
-            getCommentReplies: () => Promise.resolve([])
+            getCommentReplies: () => Promise.resolve([]),
+            getSettings: () => Promise.resolve(null),
+            startVideoDownload: () => Promise.resolve(null),
+            startChannelDownload: () => Promise.resolve(null),
+            getDownloadStatus: () => Promise.resolve(null)
         }, services);
         this.currentViewer = null;
         this.type = null; // 'video' or 'short'

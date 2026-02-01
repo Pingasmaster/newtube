@@ -8,12 +8,19 @@ services:
     volumes:
       - ./data/media:/data/media
       - ./.env:/app/.env:ro
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   routine_update:
     build: .
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     env_file:
       - .env
     volumes:

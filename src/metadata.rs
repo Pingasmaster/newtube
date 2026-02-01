@@ -198,7 +198,9 @@ async fn ensure_schema(conn: &Connection) -> Result<()> {
 }
 
 async fn migrate_comments_schema(conn: &Connection) -> Result<()> {
-    let mut rows = conn.query("PRAGMA foreign_key_list(comments)", params![]).await?;
+    let mut rows = conn
+        .query("PRAGMA foreign_key_list(comments)", params![])
+        .await?;
     let mut has_video_fk = false;
     while let Some(row) = rows.next().await? {
         let table: String = row.get(2)?;
@@ -299,8 +301,8 @@ impl MetadataStore {
 
         self.conn
             .execute(
-            &format!(
-                r#"
+                &format!(
+                    r#"
                 INSERT INTO {table} (
                     videoid, title, description, likes, dislikes, views,
                     upload_date, author, subscriber_count, duration, duration_text,
@@ -330,28 +332,28 @@ impl MetadataStore {
                     extras_json = excluded.extras_json,
                     sources_json = excluded.sources_json
                 "#,
-            ),
-            params![
-                record.videoid.as_str(),
-                record.title.as_str(),
-                record.description.as_str(),
-                record.likes,
-                record.dislikes,
-                record.views,
-                record.upload_date.as_deref(),
-                record.author.as_deref(),
-                record.subscriber_count,
-                record.duration,
-                record.duration_text.as_deref(),
-                record.channel_url.as_deref(),
-                record.thumbnail_url.as_deref(),
-                tags_json,
-                thumbnails_json,
-                extras_json,
-                sources_json,
-            ],
-        )
-        .await?;
+                ),
+                params![
+                    record.videoid.as_str(),
+                    record.title.as_str(),
+                    record.description.as_str(),
+                    record.likes,
+                    record.dislikes,
+                    record.views,
+                    record.upload_date.as_deref(),
+                    record.author.as_deref(),
+                    record.subscriber_count,
+                    record.duration,
+                    record.duration_text.as_deref(),
+                    record.channel_url.as_deref(),
+                    record.thumbnail_url.as_deref(),
+                    tags_json,
+                    thumbnails_json,
+                    extras_json,
+                    sources_json,
+                ],
+            )
+            .await?;
 
         Ok(())
     }
@@ -363,15 +365,15 @@ impl MetadataStore {
 
         self.conn
             .execute(
-            r#"
+                r#"
             INSERT INTO subtitles (videoid, languages_json)
             VALUES (:videoid, :languages_json)
             ON CONFLICT(videoid) DO UPDATE SET
                 languages_json = excluded.languages_json
             "#,
-            params![subtitles.videoid.as_str(), languages_json],
-        )
-        .await?;
+                params![subtitles.videoid.as_str(), languages_json],
+            )
+            .await?;
 
         Ok(())
     }
@@ -553,10 +555,7 @@ impl MetadataReader {
     pub async fn data_version(&self) -> Result<i64> {
         let conn = &self.conn;
         let mut rows = conn.query("PRAGMA data_version", params![]).await?;
-        let row = rows
-            .next()
-            .await?
-            .context("missing data_version row")?;
+        let row = rows.next().await?.context("missing data_version row")?;
         Ok(row.get(0)?)
     }
 
@@ -655,9 +654,7 @@ fn row_to_comment(row: &Row) -> Result<CommentRecord> {
         likes: row.get(4)?,
         time_posted: row.get(5)?,
         parent_comment_id: row.get(6)?,
-        status_likedbycreator: row
-            .get::<i64>(7)
-            .map(|value| value != 0)?,
+        status_likedbycreator: row.get::<i64>(7).map(|value| value != 0)?,
         reply_count: row.get(8)?,
     })
 }
@@ -1008,7 +1005,8 @@ mod tests {
         let mut reply = sample_comment("child", "with-comments");
         reply.parent_comment_id = Some("parent".into());
 
-        store.replace_comments("with-comments", &[parent.clone(), reply.clone()])
+        store
+            .replace_comments("with-comments", &[parent.clone(), reply.clone()])
             .await?;
 
         let comments = reader.get_comments("with-comments").await?;
@@ -1033,9 +1031,12 @@ mod tests {
         let mut third = sample_comment("3", "video-one");
         third.time_posted = Some("2024-01-01T00:10:00Z".into());
 
-        store.replace_comments("video-one", &[first.clone(), third.clone()])
+        store
+            .replace_comments("video-one", &[first.clone(), third.clone()])
             .await?;
-        store.replace_comments("video-two", &[second.clone()]).await?;
+        store
+            .replace_comments("video-two", &[second.clone()])
+            .await?;
 
         let all = reader.list_all_comments().await?;
         assert_eq!(all.len(), 3);

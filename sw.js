@@ -1,5 +1,5 @@
 // Service Worker for newtube
-const CACHE_NAME = 'newtube-static-v2';
+const CACHE_NAME = 'newtube-static-v3';
 
 // List of files to cache on install
 const urlsToCache = [
@@ -8,6 +8,7 @@ const urlsToCache = [
     '/app.js',
     '/pageHome.js',
     '/pageViewer.js',
+    '/pageAdmin.js',
     '/styles.css',
     '/Roboto-VariableFont_wdth,wght.ttf',
     '/Roboto-Italic-VariableFont_wdth,wght.ttf'

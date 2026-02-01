@@ -1,12 +1,41 @@
 # Newtube
 
-A youtube frontend clone, entirely written from the gound up in HTMlL, CSS and javascript to be extra extra fast and almost pixel-perfect with the Youtube UI. Only exceptions are bad UI/UX decisions like the very recent icons and mobile-oriented style. The backend is fully written in safe rust and some bash scripts in order to clone entire youtube channels. When a video from them is first asked by a client, the 
+## Docker Compose (recommended)
+
+This is the recommended method to serve the web UI and have the complete software stack.
+
+1. **Create a `.env` file** in this folder (same as the example below).
+2. **Run it:**
+   ```bash
+   docker compose up -d
+   ```
+
+After the `.env` is set, `docker compose up -d` is the only command you need.
+
+Example `.env`:
+```bash
+cat > .env <<'EOF'
+MEDIA_ROOT="/data/media"
+WWW_ROOT="/app/www"
+NEWTUBE_PORT="8080"
+NEWTUBE_HOST="0.0.0.0"
+NEWTUBE_MISSING_MEDIA_BEHAVIOR="404"
+EOF
+```
+
+`NEWTUBE_MISSING_MEDIA_BEHAVIOR` accepts `404` (default) or `prompt` to show an in-app download prompt for missing videos.
+
+The compose stack serves the SPA + `/api/*` on port 8080 and keeps channels fresh in the background.
+
+Admin settings live at `/admin` (no auth by default; protect it with your reverse proxy if needed).
+
+A youtube frontend clone, entirely written from the gound up in HTML, CSS and javascript to be extra extra fast and almost pixel-perfect with the Youtube UI. Only exceptions are bad UI/UX decisions like the very recent icons and mobile-oriented style. The backend is fully written in safe rust and some bash scripts in order to clone entire youtube channels. When a video from them is first asked by a client, the backend downloads the entire channels videos.
 
 There is no account system, but history and likes/dislikes still work. You can save your cookies via an ID which contains your likes/dislikes/playlists/history and is unique to you so you can erase your cookies and still have the same experience on all your devices. There is also no ad. It also is not in violation of youtube copyright as all icons are taken from material UI and open-licensed, and it does NOT serve videos from youtube directly or indirectly, therefore there is no violation of youtube's TOS as this makes NO calls to youtube.com or any google-owned subdomains.
 
 The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
 
-## Install
+## Install (manual / old school)
 
 1. **Clone and build:**
    ```bash
@@ -25,13 +54,14 @@ The Javascript caches pages and loads them only one time via a service worker to
    cat > .env <<'EOF'
    MEDIA_ROOT="/var/lib/newtube/media"
    WWW_ROOT="/var/lib/newtube/www"
-   NEWTUBE_PORT="8080"
-   NEWTUBE_HOST="0.0.0.0"
-   EOF
-   ```
+NEWTUBE_PORT="8080"
+NEWTUBE_HOST="0.0.0.0"
+NEWTUBE_MISSING_MEDIA_BEHAVIOR="404"
+EOF
+```
 4. **Place the web UI files in `WWW_ROOT`:**
    ```bash
-   rsync -a --delete index.html app.js pageHome.js pageViewer.js userData.js styles.css sw.js Roboto-*.ttf /var/lib/newtube/www/
+   rsync -a --delete index.html app.js pageHome.js pageViewer.js pageAdmin.js userData.js styles.css sw.js Roboto-*.ttf /var/lib/newtube/www/
    ```
 
 ### Run the backend (serves UI + API)
@@ -56,7 +86,7 @@ newtube-routine
 
 Schedule `newtube-routine` with cron/systemd if you want nightly content refreshes.
 
-## Docker (Arch-based image)
+## Docker (single container)
 
 Build and run:
 
@@ -70,7 +100,7 @@ Notes:
 - The container runs as a non-root user (uid 10001). Ensure the media volume is readable by that uid.
 - To override settings, mount your own `.env` at `/app/.env` or pass environment variables.
 
-## Docker Compose (tiered containers)
+## Docker Compose (details / extras)
 
 A `docker-compose.yml` is included. With a `.env` in this folder:
 

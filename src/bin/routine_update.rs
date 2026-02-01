@@ -108,6 +108,7 @@ impl<T> OneOrMany<T> {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum CreatorInfo {
@@ -129,8 +130,8 @@ impl CreatorInfo {
                 uploader_url,
             } => url
                 .as_deref()
-                .or_else(|| channel_url.as_deref())
-                .or_else(|| uploader_url.as_deref()),
+                .or(channel_url.as_deref())
+                .or(uploader_url.as_deref()),
         }
     }
 }
@@ -158,10 +159,9 @@ async fn main() -> Result<()> {
     } = RoutineArgs::parse()?;
 
     let metadata_path = media_root.join(METADATA_DB_FILE);
-    let _metadata =
-        MetadataStore::open(&metadata_path)
-            .await
-            .context("initializing metadata database")?;
+    let _metadata = MetadataStore::open(&metadata_path)
+        .await
+        .context("initializing metadata database")?;
 
     println!("Library root: {}", media_root.display());
     println!("WWW root: {}", www_root.display());
@@ -340,7 +340,10 @@ fn first_url(info: &MinimalInfo) -> Option<&str> {
 fn canonicalize_channel_url(url: &str) -> String {
     let trimmed = url.trim();
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let without_slash = without_query.trim_end_matches('/');
     without_slash.to_ascii_lowercase()
 }
@@ -386,11 +389,11 @@ mod tests {
     use super::*;
     use std::env;
     use std::io::Write;
+    use std::sync::Mutex;
     use std::{
         fs::{self, File},
         path::PathBuf,
     };
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -413,10 +416,7 @@ mod tests {
     fn routine_args_default_paths() {
         let mut parsed = None;
         with_env_file(
-            &[
-                ("MEDIA_ROOT", "/yt"),
-                ("WWW_ROOT", "/www/newtube.com"),
-            ],
+            &[("MEDIA_ROOT", "/yt"), ("WWW_ROOT", "/www/newtube.com")],
             || {
                 parsed = Some(RoutineArgs::from_slice(&[]).unwrap());
             },
@@ -430,10 +430,7 @@ mod tests {
     fn routine_args_override_paths() {
         let mut parsed = None;
         with_env_file(
-            &[
-                ("MEDIA_ROOT", "/yt"),
-                ("WWW_ROOT", "/www/newtube.com"),
-            ],
+            &[("MEDIA_ROOT", "/yt"), ("WWW_ROOT", "/www/newtube.com")],
             || {
                 parsed = Some(
                     RoutineArgs::from_slice(&[

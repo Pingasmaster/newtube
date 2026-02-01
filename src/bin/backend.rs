@@ -28,7 +28,11 @@ use axum::{
 };
 use mime_guess::{MimeGuess, mime::Mime};
 use newtube_tools::config::{
-    DEFAULT_ENV_PATH, RuntimeOverrides, read_env_file, resolve_runtime_paths,
+    DEFAULT_ENV_PATH,
+    RuntimeOverrides,
+    read_env_file,
+    resolve_runtime_paths,
+    upsert_env_value,
 };
 use newtube_tools::metadata::{
     CommentRecord, MetadataReader, SubtitleCollection, VideoRecord, VideoSource,
@@ -56,7 +60,6 @@ const SUBTITLES_SUBDIR: &str = "subtitles";
 
 // SQLite database file relative to the media root.
 const METADATA_DB_FILE: &str = "metadata.db";
-const SETTINGS_FILE: &str = "instance_settings.json";
 const DOWNLOADS_DIR: &str = "downloads";
 
 #[derive(Debug, Clone)]
@@ -181,6 +184,13 @@ impl MissingMediaBehavior {
             _ => None,
         }
     }
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::NotFound => "404",
+            Self::Prompt => "prompt",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,20 +214,23 @@ impl InstanceSettings {
 }
 
 struct SettingsStore {
-    path: PathBuf,
+    env_path: PathBuf,
     current: RwLock<InstanceSettings>,
 }
 
 impl SettingsStore {
-    fn load(media_root: &Path, defaults: InstanceSettings) -> Self {
-        let path = media_root.join(SETTINGS_FILE);
-        let current = match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or(defaults),
-            Err(_) => defaults,
-        };
+    fn load(env_path: &Path, defaults: InstanceSettings) -> Self {
+        let current = read_env_file(env_path)
+            .ok()
+            .map(|mut vars| {
+                vars.entry("NEWTUBE_MISSING_MEDIA_BEHAVIOR".to_string())
+                    .or_insert_with(|| defaults.missing_media_behavior.as_env_value().to_string());
+                InstanceSettings::from_env(&vars)
+            })
+            .unwrap_or(defaults);
 
         Self {
-            path,
+            env_path: env_path.to_path_buf(),
             current: RwLock::new(current),
         }
     }
@@ -227,7 +240,11 @@ impl SettingsStore {
     }
 
     fn update(&self, settings: InstanceSettings) -> Result<InstanceSettings> {
-        write_json_atomic(&self.path, &settings)?;
+        upsert_env_value(
+            &self.env_path,
+            "NEWTUBE_MISSING_MEDIA_BEHAVIOR",
+            settings.missing_media_behavior.as_env_value(),
+        )?;
         *self.current.write() = settings.clone();
         Ok(settings)
     }
@@ -608,6 +625,7 @@ struct FilePaths {
     shorts: PathBuf,
     thumbnails: PathBuf,
     subtitles: PathBuf,
+    metadata_db: PathBuf,
 }
 
 impl FilePaths {
@@ -618,6 +636,7 @@ impl FilePaths {
             shorts: media_root.join(SHORTS_SUBDIR),
             thumbnails: media_root.join(THUMBNAILS_SUBDIR),
             subtitles: media_root.join(SUBTITLES_SUBDIR),
+            metadata_db: media_root.join(METADATA_DB_FILE),
         }
     }
 
@@ -707,9 +726,10 @@ async fn main() -> Result<()> {
         .await
         .context("initializing metadata reader")?;
 
-    let env_vars = read_env_file(Path::new(DEFAULT_ENV_PATH)).unwrap_or_default();
+    let env_path = Path::new(DEFAULT_ENV_PATH);
+    let env_vars = read_env_file(env_path).unwrap_or_default();
     let settings_defaults = InstanceSettings::from_env(&env_vars);
-    let settings_store = Arc::new(SettingsStore::load(&media_root, settings_defaults));
+    let settings_store = Arc::new(SettingsStore::load(env_path, settings_defaults));
     let downloads = DownloadManager::new(media_root.clone(), www_root.clone());
 
     let state = AppState {
@@ -724,6 +744,7 @@ async fn main() -> Result<()> {
     // Each route is extremely small; helpers supplement anything that is shared
     // between videos and shorts.
     let app = Router::new()
+        .route("/metadata.db", get(get_metadata_db))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/downloads/video", post(start_video_download))
         .route("/api/downloads/channel", post(start_channel_download))
@@ -790,6 +811,10 @@ async fn static_fallback(State(state): State<AppState>, req: Request<Body>) -> R
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
+}
+
+async fn get_metadata_db(State(state): State<AppState>) -> ApiResult<Response> {
+    stream_file(state.files.metadata_db.clone(), None, None).await
 }
 
 async fn get_settings(State(state): State<AppState>) -> ApiResult<Json<InstanceSettings>> {
@@ -1835,6 +1860,8 @@ mod tests {
             let files = FilePaths::for_base(temp.path());
             let www_root = temp.path().join("www");
             std::fs::create_dir_all(&www_root).unwrap();
+            let env_path = temp.path().join(".env");
+            std::fs::write(&env_path, "").unwrap();
 
             Self {
                 state: AppState {
@@ -1843,7 +1870,7 @@ mod tests {
                     files: Arc::new(files),
                     www_root: Arc::new(www_root),
                     settings: Arc::new(SettingsStore::load(
-                        temp.path(),
+                        &env_path,
                         InstanceSettings {
                             missing_media_behavior: MissingMediaBehavior::NotFound,
                         },
@@ -2473,13 +2500,13 @@ mod tests {
     #[test]
     fn settings_store_defaults_and_update_persist() {
         let dir = tempdir().unwrap();
-        let settings_path = dir.path().join(SETTINGS_FILE);
-        fs::write(&settings_path, "not json").unwrap();
+        let env_path = dir.path().join(".env");
+        fs::write(&env_path, "NEWTUBE_MISSING_MEDIA_BEHAVIOR=\"prompt\"\n").unwrap();
 
         let defaults = InstanceSettings {
-            missing_media_behavior: MissingMediaBehavior::Prompt,
+            missing_media_behavior: MissingMediaBehavior::NotFound,
         };
-        let store = SettingsStore::load(dir.path(), defaults.clone());
+        let store = SettingsStore::load(&env_path, defaults.clone());
         assert_eq!(
             store.get().missing_media_behavior,
             MissingMediaBehavior::Prompt
@@ -2494,10 +2521,9 @@ mod tests {
             MissingMediaBehavior::NotFound
         );
 
-        let raw = fs::read_to_string(&settings_path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(json["missingMediaBehavior"], "not_found");
-        assert!(!settings_path.with_extension("tmp").exists());
+        let raw = fs::read_to_string(&env_path).unwrap();
+        assert!(raw.contains("NEWTUBE_MISSING_MEDIA_BEHAVIOR=\"404\""));
+        assert!(!env_path.with_extension("tmp").exists());
     }
 
     #[test]

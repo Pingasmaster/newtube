@@ -552,9 +552,8 @@ async fn main() -> Result<()> {
     println!("  - <video_id>.jpg (thumbnail)");
     println!();
     println!("Next steps:");
-    println!("1. Download likes/dislikes data separately");
-    println!("2. Download comments data separately");
-    println!("3. Process .info.json files to populate IndexedDB");
+    println!("1. Start the backend to serve this library.");
+    println!("2. Open the UI at /admin to tune missing-media behavior (optional).");
 
     Ok(())
 }

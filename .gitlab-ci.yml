@@ -1,6 +1,7 @@
 stages:
   - test
   - security
+  - deploy
 
 .test_rules: &test_rules
   rules:
@@ -95,3 +96,25 @@ trivy_scan:
     paths:
       - trivy-report.txt
     when: always
+
+deploy_prod:
+  stage: deploy
+  image: cytopia/ansible:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  environment:
+    name: production
+  before_script:
+    - mkdir -p ~/.ssh
+    - base64 -d < "$SSH_PRIVATE_KEY_B64" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - base64 -d < "$SSH_KNOWN_HOSTS_B64" > ~/.ssh/known_hosts
+    - export DEPLOY_HOST="$(base64 -d < "$DEPLOY_HOST_B64")"
+    - export DEPLOY_USER="$(base64 -d < "$DEPLOY_USER_B64")"
+  script:
+    - cat > inventory <<EOF
+      [newtube]
+      $DEPLOY_HOST ansible_user=$DEPLOY_USER
+      EOF
+    - ansible-playbook -i inventory ansible/playbook.yml

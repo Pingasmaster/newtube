@@ -79,8 +79,6 @@ class Sidebar extends Component {
         this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
         this.onNavigate = typeof onNavigate === 'function' ? onNavigate : null;
         this.resizeHandler = null;
-        this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
-        this.userDataListener = null;
         this.activeItem = 'home';
 
         // Items shown in reduced state
@@ -234,100 +232,6 @@ class Sidebar extends Component {
         }
     }
 
-    createUserDataInfo() {
-        if (!this.userDataStore) {
-            return null;
-        }
-
-        const stats = this.userDataStore.getStats();
-        const info = document.createElement('div');
-        info.className = 'sidebar-info';
-
-        const title = document.createElement('strong');
-        title.textContent = 'Your data stays on this device';
-        info.appendChild(title);
-
-        const copy = document.createElement('p');
-        copy.textContent = 'Watch history, likes, dislikes, playlists, and subscriptions are saved locally in this browser.';
-        info.appendChild(copy);
-
-        const sync = document.createElement('p');
-        sync.textContent = 'Export a JSON backup to sync across devices, then import it from here on the destination device.';
-        info.appendChild(sync);
-
-        const actions = document.createElement('div');
-        actions.className = 'sidebar-info-actions';
-        const exportBtn = document.createElement('button');
-        exportBtn.type = 'button';
-        exportBtn.className = 'sidebar-info-btn';
-        exportBtn.textContent = 'Export data';
-        exportBtn.addEventListener('click', () => this.exportUserData());
-        const importBtn = document.createElement('button');
-        importBtn.type = 'button';
-        importBtn.className = 'sidebar-info-btn';
-        importBtn.textContent = 'Import data';
-        actions.appendChild(exportBtn);
-        actions.appendChild(importBtn);
-        info.appendChild(actions);
-
-        const fileInput = document.createElement('input');
-        fileInput.type = 'file';
-        fileInput.accept = 'application/json';
-        fileInput.addEventListener('change', (event) => {
-            const files = event.target.files;
-            if (files && files[0]) {
-                this.importUserData(files[0]);
-            }
-            event.target.value = '';
-        });
-        info.appendChild(fileInput);
-        importBtn.addEventListener('click', () => fileInput.click());
-
-        const statsBlock = document.createElement('div');
-        statsBlock.className = 'sidebar-info-stats';
-        [
-            ['Likes', stats.likes],
-            ['Dislikes', stats.dislikes],
-            ['Playlists', stats.playlists],
-            ['Subscriptions', stats.subscriptions],
-            ['Watched', stats.watched]
-        ].forEach(([label, value]) => {
-            const stat = document.createElement('span');
-            stat.textContent = `${label}: ${value}`;
-            statsBlock.appendChild(stat);
-        });
-        info.appendChild(statsBlock);
-
-        const tip = document.createElement('p');
-        tip.textContent = 'Tip: email the export file to yourself or store it in a password manager to keep devices in sync.';
-        info.appendChild(tip);
-
-        return info;
-    }
-
-    exportUserData() {
-        if (this.userDataStore) {
-            this.userDataStore.downloadExport();
-        }
-    }
-
-    importUserData(file) {
-        if (!file || !this.userDataStore) {
-            return;
-        }
-        const reader = new FileReader();
-        reader.onload = () => {
-            try {
-                this.userDataStore.importFromString(reader.result);
-                alert('✅ User data imported. All likes, playlists, subscriptions, and history now match the file.');
-            } catch (error) {
-                console.error('❌ Import failed:', error);
-                alert('⚠️ Could not import that file. Please provide a newtube export JSON.');
-            }
-        };
-        reader.readAsText(file);
-    }
-
     notifyStateChange() {
         if (typeof this.onStateChange === 'function') {
             this.onStateChange(this.state);
@@ -342,10 +246,6 @@ class Sidebar extends Component {
         this.setInitialState();
         this.resizeHandler = () => this.handleResize();
         window.addEventListener('resize', this.resizeHandler);
-        if (this.userDataStore && !this.userDataListener) {
-            this.userDataListener = () => this.render();
-            window.addEventListener('newtube:userdata', this.userDataListener);
-        }
         
         this.render();
         return this.element;
@@ -354,9 +254,6 @@ class Sidebar extends Component {
     destroy() {
         if (this.resizeHandler) {
             window.removeEventListener('resize', this.resizeHandler);
-        }
-        if (this.userDataListener) {
-            window.removeEventListener('newtube:userdata', this.userDataListener);
         }
         super.destroy();
     }
@@ -476,6 +373,7 @@ class VideoGrid extends Component {
     constructor() {
         super();
         this.videos = [];
+        this.mediaKind = 'video';
         this.colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dfe6e9', '#6c5ce7', '#fd79a8'];
         this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
         this.userDataListener = null;
@@ -504,8 +402,11 @@ class VideoGrid extends Component {
         this.element.appendChild(placeholder);
     }
 
-    setVideos(videos = []) {
+    setVideos(videos = [], options = {}) {
         this.videos = Array.isArray(videos) ? videos : [];
+        if (options.mediaKind) {
+            this.mediaKind = options.mediaKind;
+        }
         if (this.element) {
             this.renderVideos();
         }
@@ -534,7 +435,11 @@ class VideoGrid extends Component {
     createVideoCard(video, index) {
         const card = document.createElement('a');
         card.className = 'video-card';
-        card.href = `/watch?v=${encodeURIComponent(video.videoid)}`;
+        const href =
+            this.mediaKind === 'short'
+                ? `/shorts/${encodeURIComponent(video.videoid)}`
+                : `/watch?v=${encodeURIComponent(video.videoid)}`;
+        card.href = href;
         card.dataset.videoId = video.videoid;
 
         const thumbnail = document.createElement('div');
@@ -708,7 +613,8 @@ class MainContent extends Component {
         this.currentView = 'home';
         this.userDataStore = typeof window !== 'undefined' ? window.userDataStore : null;
         this.userDataListener = null;
-        this.homeVideos = [];
+        this.homeVideos = null;
+        this.shortVideos = null;
     }
 
     init() {
@@ -760,8 +666,15 @@ class MainContent extends Component {
 
     setVideos(videos) {
         this.homeVideos = Array.isArray(videos) ? videos : [];
-        if (this.videoGrid) {
-            this.videoGrid.setVideos(this.homeVideos);
+        if (this.videoGrid && this.currentView === 'home') {
+            this.videoGrid.setVideos(this.homeVideos, { mediaKind: 'video' });
+        }
+    }
+
+    setShorts(shorts) {
+        this.shortVideos = Array.isArray(shorts) ? shorts : [];
+        if (this.videoGrid && this.currentView === 'shorts') {
+            this.videoGrid.setVideos(this.shortVideos, { mediaKind: 'short' });
         }
     }
 
@@ -808,6 +721,20 @@ class MainContent extends Component {
         this.youSection.style.display = view === 'you' ? '' : 'none';
         this.subscriptionsSection.style.display = view === 'subscriptions' ? '' : 'none';
 
+        if (view === 'home') {
+            if (this.homeVideos) {
+                this.videoGrid.setVideos(this.homeVideos, { mediaKind: 'video' });
+            } else {
+                this.videoGrid.setLoading('Loading videos…');
+            }
+        }
+        if (view === 'shorts') {
+            if (this.shortVideos) {
+                this.videoGrid.setVideos(this.shortVideos, { mediaKind: 'short' });
+            } else {
+                this.videoGrid.setLoading('Loading shorts…');
+            }
+        }
         if (view === 'history') this.renderHistory();
         if (view === 'you') this.renderYouSection();
         if (view === 'subscriptions') this.renderSubscriptions();
@@ -1125,11 +1052,16 @@ class HomePage {
 
         try {
             await this.services.ready();
-            const videos = await this.services.getVideos();
+            const [videos, shorts] = await Promise.all([
+                this.services.getVideos(),
+                this.services.getShorts()
+            ]);
             this.content.setVideos(videos || []);
+            this.content.setShorts(shorts || []);
         } catch (error) {
             console.error('⚠️ Failed to load home videos:', error);
             this.content.setVideos([]);
+            this.content.setShorts([]);
         }
     }
 
@@ -1168,8 +1100,12 @@ class HomePage {
     async refresh() {
         try {
             await this.services.ready();
-            const videos = await this.services.getVideos();
+            const [videos, shorts] = await Promise.all([
+                this.services.getVideos(),
+                this.services.getShorts()
+            ]);
             this.content.setVideos(videos || []);
+            this.content.setShorts(shorts || []);
         } catch (error) {
             console.error('⚠️ Failed to refresh home videos:', error);
         }
@@ -1188,6 +1124,9 @@ class HomePage {
         switch (key) {
             case 'admin':
                 window.location.href = '/admin';
+                break;
+            case 'shorts':
+                this.content.setView('shorts');
                 break;
             case 'history':
                 this.content.setView('history');

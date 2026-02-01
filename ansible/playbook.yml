@@ -1,0 +1,57 @@
+---
+- name: Deploy Newtube via Docker Compose
+  hosts: newtube
+  become: true
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    - name: Ensure required packages are installed (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name:
+          - git
+          - docker.io
+          - docker-compose-plugin
+        update_cache: true
+      when: ansible_facts.os_family == "Debian"
+
+    - name: Fail on unsupported OS families
+      ansible.builtin.fail:
+        msg: "This playbook currently supports Debian/Ubuntu only. Extend package tasks for your distro."
+      when: ansible_facts.os_family != "Debian"
+
+    - name: Ensure Docker service is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ newtube_app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create media directory on host
+      ansible.builtin.file:
+        path: "{{ newtube_media_root_host }}"
+        state: directory
+        mode: "0755"
+
+    - name: Clone or update repository
+      ansible.builtin.git:
+        repo: "{{ newtube_repo }}"
+        dest: "{{ newtube_app_dir }}"
+        version: "{{ newtube_version }}"
+        update: true
+
+    - name: Write .env file
+      ansible.builtin.template:
+        src: templates/newtube.env.j2
+        dest: "{{ newtube_app_dir }}/.env"
+        mode: "0640"
+
+    - name: Start or update the stack
+      ansible.builtin.command:
+        cmd: docker compose up -d --build
+        chdir: "{{ newtube_app_dir }}"

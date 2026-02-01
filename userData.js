@@ -266,7 +266,9 @@ class UserDataStore {
 
 if (typeof window !== 'undefined') {
     window.UserDataStore = UserDataStore;
-    if (!window.__newtube_TEST__) {
+    const isTest =
+        window.__NEWTUBE_TEST__ === true || window.__newtube_TEST__ === true;
+    if (!isTest) {
         window.userDataStore = new UserDataStore();
     }
 }

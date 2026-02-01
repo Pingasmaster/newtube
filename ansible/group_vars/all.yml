@@ -1,0 +1,24 @@
+# Newtube deployment settings
+newtube_repo: "https://github.com/Pingasmaster/newtube.git"
+newtube_version: "main"
+newtube_app_dir: "/opt/newtube"
+
+# Host paths
+newtube_media_root_host: "/var/lib/newtube/media"
+
+# Container paths
+newtube_media_root: "/data/media"
+newtube_www_root: "/app/www"
+
+# Backend API
+newtube_port: 8080
+newtube_host: "0.0.0.0"
+
+# Public frontend
+newtube_public_port: 8080
+
+# Missing media behavior: 404 or prompt
+newtube_missing_media_behavior: "404"
+
+# Optional manual override for download_channel binary
+# newtube_download_bin: "/usr/local/bin/download_channel"

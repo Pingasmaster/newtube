@@ -1,19 +1,36 @@
 services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "${NEWTUBE_PUBLIC_PORT:-8080}:80"
+    environment:
+      NEWTUBE_API_HOST: backend
+      NEWTUBE_API_PORT: "${NEWTUBE_PORT:-8080}"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - edge
+      - core
+    restart: unless-stopped
+
   backend:
     build: .
-    ports:
-      - "8080:8080"
     env_file:
       - .env
     volumes:
-      - ./data/media:/data/media
-      - ./.env:/app/.env:ro
+      - "${MEDIA_ROOT_HOST:-./data/media}:${MEDIA_ROOT:-/data/media}"
+      - ./.env:/app/.env
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/8080"]
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/$NEWTUBE_PORT"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 10s
+    networks:
+      - core
     restart: unless-stopped
 
   routine_update:
@@ -24,9 +41,11 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data/media:/data/media
-      - ./.env:/app/.env:ro
+      - "${MEDIA_ROOT_HOST:-./data/media}:${MEDIA_ROOT:-/data/media}"
+      - ./.env:/app/.env
     command: ["sh", "-c", "while true; do routine_update; sleep 24h; done"]
+    networks:
+      - core
     restart: unless-stopped
 
   downloader:
@@ -35,6 +54,13 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data/media:/data/media
-      - ./.env:/app/.env:ro
+      - "${MEDIA_ROOT_HOST:-./data/media}:${MEDIA_ROOT:-/data/media}"
+      - ./.env:/app/.env
     entrypoint: ["download_channel"]
+    networks:
+      - core
+
+networks:
+  edge:
+  core:
+    internal: true

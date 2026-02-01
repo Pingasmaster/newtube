@@ -1,0 +1,6 @@
+[newtube]
+# Replace with your VM IP or hostname
+example.vm ansible_user=ubuntu
+
+[newtube:vars]
+ansible_python_interpreter=/usr/bin/python3

@@ -1,106 +1,98 @@
 # Newtube
 
-A youtube frontend clone, entirely written from the gound up in HTML, CSS and javascript to be extra extra fast and almost pixel-perfect with the Youtube UI. Only exceptions are bad UI/UX decisions like the very recent icons and mobile-oriented style. The backend is fully written in safe rust and some bash scripts in order to clone entire youtube channels. When a video from them is first asked by a client, the backend downloads the entire channels videos.
+Newtube is a self-hosted YouTube library UI. The Rust backend serves a local media library (videos, shorts, subtitles, thumbnails, comments) and a simple JSON API. Downloads are performed by `yt-dlp`, and the frontend is a static SPA that stores user data locally (likes, playlists, history) with export/import.
 
-There is no account system, but history and likes/dislikes still work. You can save your cookies via an ID which contains your likes/dislikes/playlists/history and is unique to you so you can erase your cookies and still have the same experience on all your devices. There is also no ad. It also is not in violation of youtube copyright as all icons are taken from material UI and open-licensed, and it does NOT serve videos from youtube directly or indirectly, therefore there is no violation of youtube's TOS as this makes NO calls to youtube.com or any google-owned subdomains.
-
-The Javascript caches pages and loads them only one time via a service worker to have instant subsequent loading times of non video-related assets for maximum speed and responsiveness. Pages are drawn into a container and which is then deleted and recreated when changing pages to keep everything in the same page. Page structure is mainly in the javascript files, which manipulate the HTML in real time.
+Key points:
+- Local media only. The UI never streams from YouTube directly; downloads happen ahead of time via `download_channel`.
+- User data is localStorage-based with JSON export/import (no accounts).
+- All configuration lives in a single `.env` file (source of truth). The Admin page writes back to `.env`.
+- The SQLite metadata database is served at `/metadata.db` from `MEDIA_ROOT`.
 
 ## Docker Compose (recommended)
 
-This is the recommended method to serve the web UI and have the complete software stack.
+This is the default, multi-tier deployment: a frontend (nginx), backend API, and background workers.
 
-1. **Create a `.env` file** in this folder (same as the example below).
-2. **Run it:**
+1. Copy the example file and edit it:
+   ```bash
+   cp .env.example .env
+   ```
+2. Start the stack:
    ```bash
    docker compose up -d
    ```
 
-This brings up:
-- `backend`: serves the UI + API on port 8080.
-- `routine_update`: runs `routine_update` in a loop for periodic refreshes.
-- `downloader` (profile `manual`): on-demand channel downloads.
+Services:
+- `frontend`: static UI + reverse proxy for `/api/*` and `/metadata.db`.
+- `backend`: Rust API server (media + metadata). Not exposed publicly.
+- `routine_update`: periodic refresh of all known channels.
+- `downloader` (manual profile): on-demand downloads.
 
-Download a channel via compose:
-
+Download a channel:
 ```bash
 docker compose run --rm downloader https://www.youtube.com/@LinusTechTips
 ```
 
-After the `.env` is set, `docker compose up -d` is the only command you need.
+### Configuration (.env)
 
-Example `.env`:
-```bash
-cat > .env <<'EOF'
-MEDIA_ROOT="/data/media"
-WWW_ROOT="/app/www"
-NEWTUBE_PORT="8080"
-NEWTUBE_HOST="0.0.0.0"
-NEWTUBE_MISSING_MEDIA_BEHAVIOR="404"
-EOF
-```
+All runtime configuration is read from `.env`.
 
-`NEWTUBE_MISSING_MEDIA_BEHAVIOR` accepts `404` (default) or `prompt` to show an in-app download prompt for missing videos.
+Common variables:
+- `MEDIA_ROOT`: where media and metadata are stored inside containers.
+- `MEDIA_ROOT_HOST`: host path that is mounted to `MEDIA_ROOT`.
+- `WWW_ROOT`: path to the static UI inside containers (backend uses this for manual deployments).
+- `NEWTUBE_PORT`: backend API port inside the Docker network.
+- `NEWTUBE_HOST`: backend bind host (use `0.0.0.0` inside containers).
+- `NEWTUBE_PUBLIC_PORT`: host port for the frontend container.
+- `NEWTUBE_MISSING_MEDIA_BEHAVIOR`: `404` (default) or `prompt` to show a download prompt.
+- `NEWTUBE_DOWNLOAD_BIN`: optional override for the `download_channel` binary path (manual installs).
 
-The compose stack serves the SPA + `/api/*` on port 8080 and keeps channels fresh in the background.
+The Admin UI (`/admin`) updates `NEWTUBE_MISSING_MEDIA_BEHAVIOR` directly inside `.env`.
+The Admin page has no authentication; protect it with your reverse proxy if the instance is public.
 
-Admin settings live at `/admin` (no auth by default; please protect it with your reverse proxy).
+## Manual install (still supported)
 
-## Install (manual / old school)
-
-1. **Clone and build:**
+1. Build the binaries:
    ```bash
-   git clone https://github.com/Pingasmaster/newtube.git
-   cd newtube
    cargo build --release
    ```
-2. **Copy the binaries where you want to run them:**
+2. Install them (keep the default names, or set `NEWTUBE_DOWNLOAD_BIN` if you rename):
    ```bash
-   sudo install -m 755 target/release/backend /usr/local/bin/newtube-backend
-   sudo install -m 755 target/release/download_channel /usr/local/bin/newtube-download
-   sudo install -m 755 target/release/routine_update /usr/local/bin/newtube-routine
+   sudo install -m 755 target/release/backend /usr/local/bin/backend
+   sudo install -m 755 target/release/download_channel /usr/local/bin/download_channel
+   sudo install -m 755 target/release/routine_update /usr/local/bin/routine_update
    ```
-3. **Create a `.env` file** in the working directory you will run the binaries from:
+3. Create a `.env` file in the working directory:
    ```bash
    cat > .env <<'EOF'
-   MEDIA_ROOT="/var/lib/newtube/media"
-   WWW_ROOT="/var/lib/newtube/www"
-NEWTUBE_PORT="8080"
-NEWTUBE_HOST="0.0.0.0"
-NEWTUBE_MISSING_MEDIA_BEHAVIOR="404"
-EOF
-```
-4. **Place the web UI files in `WWW_ROOT`:**
+   MEDIA_ROOT=/var/lib/newtube/media
+   WWW_ROOT=/var/lib/newtube/www
+   NEWTUBE_PORT=8080
+   NEWTUBE_HOST=0.0.0.0
+   NEWTUBE_MISSING_MEDIA_BEHAVIOR=404
+   EOF
+   ```
+4. Copy the frontend assets into `WWW_ROOT`:
    ```bash
    rsync -a --delete index.html app.js pageHome.js pageViewer.js pageAdmin.js userData.js styles.css sw.js Roboto-*.ttf /var/lib/newtube/www/
    ```
+5. Run the backend:
+   ```bash
+   backend
+   ```
 
-### Run the backend (serves UI + API)
-
+Download a channel:
 ```bash
-newtube-backend
+download_channel https://www.youtube.com/@LinusTechTips
 ```
 
-The backend serves the SPA and the `/api/*` endpoints from the same HTTP port.
-
-### Download a channel
-
+Refresh all channels:
 ```bash
-newtube-download https://www.youtube.com/@LinusTechTips
+routine_update
 ```
 
-### Refresh all channels
-
-```bash
-newtube-routine
-```
-
-Schedule `newtube-routine` with cron/systemd if you want nightly content refreshes.
-
-## Reverse proxy examples
+## Reverse proxy examples (manual installs)
 
 ### Nginx
-
 ```
 server {
     listen 80;
@@ -117,7 +109,6 @@ server {
 ```
 
 ### Apache (httpd)
-
 ```
 <VirtualHost *:80>
     ServerName example.com
@@ -129,79 +120,51 @@ server {
 </VirtualHost>
 ```
 
-## Program reference
+## Tests
 
-Every Rust binary is produced by `cargo build --release`. The binaries read `.env` from the current working directory and use its values unless you override via flags.
+Before running tests, install Node modules:
+```bash
+npm install
+```
 
-### `backend`
+- `cargo test` covers the Rust backend (module `metadata.rs`).
+- `npm run test` / `npm run test:unit` runs Jest with `fake-indexeddb` and `jsdom`.
+- `npm run test:coverage` generates HTML/LCOV under `coverage/jest`.
+- `npm run test:e2e` runs Cypress headless on port 4173.
 
-- Purpose: Axum HTTP server that serves the web UI and `/api/*` routes.
-- Flags:
-  - `--media-root <path>`: override `MEDIA_ROOT`.
-  - `--www-root <path>`: override `WWW_ROOT`.
-  - `--port <port>`: override `NEWTUBE_PORT`.
-  - `--host <ip>`: override `NEWTUBE_HOST`.
-- Usage example:
-  ```bash
-  newtube-backend --port 9090
-  ```
+## CI workflows
 
-### `download_channel`
+### GitHub Actions
 
-- Purpose: clones an entire YouTube channel (videos, Shorts, comments, subtitles, thumbnails) into the local library and keeps the SQLite database fresh.
-- Dependencies: `yt-dlp` must be on the `PATH`, plus optional `cookies.txt` in `MEDIA_ROOT` when you need to access members-only/private feeds.
-- Behaviour:
-  - Creates `{MEDIA_ROOT}/{videos,shorts,subtitles,thumbnails,comments}` as needed.
-  - Downloads muxed video formats, subtitles (auto + manual), thumbnails, `.info.json`, `.description`, and the latest ~500 comments per video.
-  - Writes/updates `{MEDIA_ROOT}/download-archive.txt` so future runs skip duplicates.
-  - Inserts/updates rows inside `{MEDIA_ROOT}/metadata.db` so the backend sees the new content immediately.
-- Flags:
-  - `--media-root <path>`: store media + metadata under a custom directory.
-  - `--www-root <path>`: controls where the static frontend directory lives.
-- Usage example:
-  ```bash
-  newtube-download --media-root /data/yt --www-root /srv/www https://www.youtube.com/@LinusTechTips
-  ```
+- `.github/workflows/ci.yml` runs on pushes to `main`/`dev` and on pull requests. It checks Rust formatting/lints/tests and runs the frontend suite via `npm run test`, `npm run test:coverage`, and `npm run test:e2e`, with the Jest coverage uploaded as an artifact.
+- `.github/workflows/security.yml` runs on a weekly schedule (Monday 02:00 UTC) or via manual dispatch. It executes `npm audit`, `cargo audit`, and a Trivy filesystem scan, and uploads the Trivy report artifact.
 
-### `routine_update`
+### GitLab CI
 
-- Purpose: cron-friendly helper that re-runs `download_channel` for every channel already present under `MEDIA_ROOT`.
-- Behaviour:
-  - Walks `{MEDIA_ROOT}/videos/**` and `{MEDIA_ROOT}/shorts/**` looking for `<video_id>.info.json` files.
-  - Extracts the original `channel_url`/`uploader_url` from those JSON blobs and deduplicates them.
-  - Sequentially invokes `download_channel <channel_url>` so each channel gets refreshed with the latest uploads/comments.
-- Flags:
-  - `--media-root <path>`: matches the library root passed to `download_channel`/`backend`.
-  - `--www-root <path>`: forwarded to each `download_channel` call so the helper can rebuild the same site directory.
-- Usage example:
-  ```bash
-  newtube-routine
-  ```
-
-All binaries share the same Rust crate (`newtube_tools`), so adding new metadata fields or config knobs only requires updating the shared structs once.
-
-# Tests
-
-Before runing any tests, you need to run `npm install` to install modules.
-
-`cargo test` covers the Rust backend (module `metadata.rs`)
-
-`npm run test` / `npm run test:unit` : launches Jest with `fake-indexeddb`, `jsdom` and validates front helpers (normalisation vidéo, opérations IndexedDB, API client, stockage user). Les fichiers concernés se trouvent dans `tests/js/*.test.js`
-
-`npm run test:coverage` : même suite Jest que ci-dessus mais enregistre un rapport HTML/LCOV sous `coverage/jest`
-
-`npm run test:e2e` : launches Cypress on port 4173. It now covers **both** `cypress/e2e/home.cy.js` (home grid + sidebar states per desktop/tablet/mobile rules from `cypress/fixtures/bootstrap.json`) and `cypress/e2e/watch.cy.js` (video player metadata, comments rendering and like/dislike/subscription toggles with mocked API responses)
-
-# CI workflows
-
-## GitHub Actions
-
-- `.github/workflows/ci.yml` runs on pushes to `main`/`dev` and on pull requests. It uses `ubuntu-latest`, checks Rust formatting, runs `cargo check`, `cargo clippy`, and `cargo test`, then runs the frontend suite with `npm run test`, `npm run test:coverage`, and `npm run test:e2e`. Jest coverage is uploaded as an artifact.
-- `.github/workflows/security.yml` runs on a weekly schedule (Monday 02:00 UTC) or via manual dispatch. It performs `npm audit`, `cargo audit`, and a Trivy filesystem scan, and uploads the Trivy report artifact.
-- Tooling is sourced via GitHub Actions (checkout, cache, setup-node, upload-artifact), and Node is pinned to the latest release via `node-version: node`.
-
-## GitLab CI
-
-- `.gitlab-ci.yml` mirrors the GitHub workflows with `test` and `security` stages. `backend` and `frontend` run for merge requests and on pushes to `main`/`dev`, using the same Rust checks and npm test commands and keeping the Jest coverage as an artifact.
+- `.gitlab-ci.yml` mirrors the GitHub workflows with `test` and `security` stages. `backend` and `frontend` run on merge requests and on pushes to `main`/`dev`, using the same Rust checks and npm test commands and keeping the Jest coverage as an artifact.
 - Security jobs (`npm_audit`, `cargo_audit`, `trivy_scan`) run only on scheduled or manually-triggered pipelines and produce the same audit outputs, including the Trivy report artifact.
-- GitLab uses explicit container images (`rust:latest`, `node:latest`, `cypress/included:latest`, `aquasec/trivy:latest`) rather than GitHub-hosted runners.
+
+## Automating Ansible via CI
+
+We automated deployments from GitLab CI (not github actions, only deviation between the two.):
+For each variable, we store the base64 string in a GitLab File variable (Project settings -> CI/CD -> Variables,the file content is the base64).
+
+Example to generate:
+- SSH_PRIVATE_KEY_B64: base64 -w 0 ~/.ssh/id_rsa
+- SSH_KNOWN_HOSTS_B64: ssh-keyscan -H your.vm.host | base64 -w 0
+- DEPLOY_HOST_B64: echo -n "your.vm.host" | base64 -w 0
+- DEPLOY_USER_B64: echo -n "ubuntu" | base64 -w 0
+
+GitLab note: the repo ships a `deploy_prod` job in `.gitlab-ci.yml` that decodes base64 “file” variables for SSH (key + known_hosts) and the target host/user, builds an inventory on the fly, and runs the Ansible playbook against a VM in our proxmo>
+It’s manual on `main`, so you control when deployments happen.
+
+## Ansible deployment
+
+A minimal Ansible configuration is included in `ansible/`. It installs Docker, clones the repo on a VM, writes the `.env`, and runs `docker compose up -d`.
+
+Quick start:
+```bash
+cd ansible
+cp inventory.example inventory
+# edit inventory and group_vars/all.yml
+ansible-playbook -i inventory playbook.yml

@@ -146,6 +146,49 @@ pub fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     Ok(vars)
 }
 
+/// Updates or appends a single env var inside the target file while preserving
+/// unrelated lines and comments.
+pub fn upsert_env_value(path: &Path, key: &str, value: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("Creating {}", parent.display()))?;
+    }
+
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut updated = false;
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        let (prefix, rest) = if let Some(stripped) = trimmed.strip_prefix("export ") {
+            ("export ", stripped)
+        } else {
+            ("", trimmed)
+        };
+        let Some((candidate, _)) = rest.split_once('=') else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if candidate.trim() == key {
+            lines.push(format!("{indent}{prefix}{key}=\"{escaped}\""));
+            updated = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !updated {
+        lines.push(format!("{key}=\"{escaped}\""));
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, lines.join("\n") + "\n")?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
